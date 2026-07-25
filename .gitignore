@@ -1,0 +1,9 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno (¡NO SUBIR NUNCA!)
+.env
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
