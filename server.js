@@ -49,7 +49,6 @@ app.use("/api/", globalLimiter);
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "BIB Mates";
 const SITE_URL = process.env.SITE_URL || "https://bibmates.com.ar";
 const BACKEND_URL = process.env.BACKEND_URL || "https://bib-mates-backend.onrender.com";
-const DESCUENTO_TRANSFERENCIA = 0.10;
 
 // --- CLIENTES ---
 const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
@@ -206,7 +205,7 @@ async function enviarEmailTransferencia(orderData, datosTransferencia) {
     html: `
       <div style="font-family: sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
         <h2 style="color: #C4A278;">¡Gracias por tu pedido, ${orderData.nombre_del_cliente}!</h2>
-        <p>Para confirmarlo, hacé la transferencia por el total indicado abajo (ya incluye el 10% de descuento):</p>
+        <p>Para confirmarlo, hacé la transferencia por el total indicado abajo:</p>
 
         <table style="width: 100%; border-collapse: collapse; border: 1px solid #ddd; margin: 20px 0;">
           <thead>
@@ -227,7 +226,7 @@ async function enviarEmailTransferencia(orderData, datosTransferencia) {
           </tbody>
         </table>
 
-        <p><b>Descuento por transferencia:</b> -$${Number(orderData.descuento).toLocaleString('es-AR')}</p>
+        ${orderData.descuento > 0 ? `<p><b>Descuento aplicado:</b> -$${Number(orderData.descuento).toLocaleString('es-AR')}</p>` : ''}
         <p><b>Envío:</b> ${Number(orderData.costo_de_envio) > 0 ? '$' + Number(orderData.costo_de_envio).toLocaleString('es-AR') : 'A coordinar por WhatsApp'}</p>
 
         <div style="background:#f9f9f9; border:1px solid #ddd; padding:16px; border-radius:6px; margin:16px 0;">
@@ -355,9 +354,9 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
   }
 
   try {
+    // Se toma el precio exacto que proviene del frontend según la lógica de transferencia/contado
     const totalProductos = items.reduce((sum, item) => sum + (Number(item.price) * Number(item.quantity)), 0);
-    const descuento = Math.round(totalProductos * DESCUENTO_TRANSFERENCIA);
-    const total = (totalProductos - descuento) + Number(shippingCost || 0);
+    const total = totalProductos + Number(shippingCost || 0);
 
     const datosTransferencia = await obtenerDatosTransferencia();
 
@@ -374,7 +373,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
         codigo_postal: customer.postalCode,
         productos: items,
         costo_de_envio: Number(shippingCost || 0),
-        descuento,
+        descuento: 0,
         total,
         estado: "pendiente",
         metodo_pago: "transferencia",
@@ -425,7 +424,6 @@ app.patch("/api/admin/orders/:id/confirm-transfer", requireAdminAuth, async (req
 // --- WEBHOOK SEGURA DE MERCADO PAGO ---
 app.post("/api/payment/webhook", async (req, res) => {
   try {
-    // 1. Verificación opcional pero recomendada de firma HMAC de Mercado Pago
     const xSignature = req.headers["x-signature"];
     const xRequestId = req.headers["x-request-id"];
 
@@ -447,7 +445,7 @@ app.post("/api/payment/webhook", async (req, res) => {
 
       if (sha !== hash) {
         console.warn("Intento de webhook no autorizado o con firma inválida.");
-        return res.sendStatus(200); // 200 para evitar retries de bots
+        return res.sendStatus(200);
       }
     }
 
@@ -458,7 +456,6 @@ app.post("/api/payment/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 2. Consulta directa a la API de Mercado Pago (Fuente de verdad)
     const mpResponse = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
     });
