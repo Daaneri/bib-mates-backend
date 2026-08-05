@@ -41,7 +41,10 @@ const SITE_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
 
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
-const supabase = createClient(SUPABASE_URL || "", SUPABASE_KEY || "");
+const DEFAULT_URL = process.env.SUPABASE_URL || "https://placeholder.supabase.co";
+const DEFAULT_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
+
+const supabase = createClient(DEFAULT_URL, DEFAULT_KEY);
 
 // Configuración Nodemailer
 const transporter = nodemailer.createTransport({
