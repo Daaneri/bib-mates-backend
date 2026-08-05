@@ -1,6 +1,9 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import crypto from "crypto";
 import { Resend } from "resend";
 import { MercadoPagoConfig, Preference } from "mercadopago";
 import { createClient } from "@supabase/supabase-js";
@@ -8,21 +11,74 @@ import { createClient } from "@supabase/supabase-js";
 dotenv.config();
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
+// --- 1. MIDDLEWARES DE SEGURIDAD GENERAL ---
+app.use(helmet());
+
+// Restringir orígenes permitidos en CORS
+const allowedOrigins = [
+  process.env.SITE_URL || "https://bibmates.com.ar",
+  "https://www.bibmates.com.ar",
+  "http://localhost:5173" // Para desarrollo local
+];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Acceso no permitido por política de CORS"));
+      }
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json({ limit: "10kb" })); // Previene cargas masivas de datos en el body
+
+// Límite global de peticiones (Rate Limiting)
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 150,
+  message: { error: "Demasiadas solicitudes. Por favor reintenta más tarde." },
+});
+app.use("/api/", globalLimiter);
+
+// --- CONFIGURACIONES ---
 const BUSINESS_NAME = process.env.BUSINESS_NAME || "BIB Mates";
 const SITE_URL = process.env.SITE_URL || "https://bibmates.com.ar";
 const BACKEND_URL = process.env.BACKEND_URL || "https://bib-mates-backend.onrender.com";
 const DESCUENTO_TRANSFERENCIA = 0.10;
 
-// --- Clientes ---
+// --- CLIENTES ---
 const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// --- Trae los datos de transferencia cargados en el panel admin (site_settings) ---
-// Si por algún motivo no están cargados ahí, cae a las variables de entorno como respaldo.
+// --- MIDDLEWARE DE AUTENTICACIÓN PARA ADMIN ---
+async function requireAdminAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Acceso denegado. Token ausente." });
+    }
+
+    const token = authHeader.split(" ")[1];
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+
+    if (error || !user) {
+      return res.status(401).json({ error: "Sesión inválida o expirada." });
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Error autenticando la petición." });
+  }
+}
+
+// --- FUNCIONES AUXILIARES ---
 async function obtenerDatosTransferencia() {
   const { data, error } = await supabase
     .from("site_settings")
@@ -45,33 +101,6 @@ async function obtenerDatosTransferencia() {
   };
 }
 
-// --- ENVIO: Tarifas fijas ---
-app.post("/api/shipping/quote", async (req, res) => {
-  const tarifasFijas = [
-    {
-      carrierDescription: "Correo Argentino",
-      serviceDescription: "Envío Estándar",
-      deliveryEstimate: "3-5 días",
-      totalPrice: 13000
-    },
-    {
-      carrierDescription: "Motomensajería",
-      serviceDescription: "Envío Express (En el día)",
-      deliveryEstimate: "24hs",
-      totalPrice: 0,
-      customLabel: "A coordinar por WhatsApp"
-    }
-  ];
-
-  res.json({ rates: tarifasFijas });
-});
-
-// --- ENVIO: Geocode ---
-app.get("/api/shipping/geocode/:postalCode", async (req, res) => {
-  res.json({ locality: "", state: { name: "" } });
-});
-
-// --- Email de notificación al ADMIN ---
 async function enviarEmailNotificacion(orderData) {
   const { error } = await resend.emails.send({
     from: `${BUSINESS_NAME} <onboarding@resend.dev>`,
@@ -120,10 +149,9 @@ async function enviarEmailNotificacion(orderData) {
     `,
   });
 
-  if (error) throw new Error(JSON.stringify(error));
+  if (error) console.error("Error enviando email al admin:", error);
 }
 
-// --- Email de confirmación al CLIENTE (Mercado Pago) ---
 async function enviarEmailConfirmacionCliente(orderData) {
   if (!orderData.email) return;
 
@@ -168,7 +196,6 @@ async function enviarEmailConfirmacionCliente(orderData) {
   if (error) console.error("Error enviando email al cliente:", error);
 }
 
-// --- Email de instrucciones de transferencia al CLIENTE ---
 async function enviarEmailTransferencia(orderData, datosTransferencia) {
   if (!orderData.email) return;
 
@@ -219,12 +246,41 @@ async function enviarEmailTransferencia(orderData, datosTransferencia) {
   if (error) console.error("Error enviando email de transferencia:", error);
 }
 
-// --- PAGO: crear pedido en Supabase + preferencia de MercadoPago ---
+// --- RUTAS PÚBLICAS DE ENVÍO ---
+app.post("/api/shipping/quote", async (req, res) => {
+  const tarifasFijas = [
+    {
+      carrierDescription: "Correo Argentino",
+      serviceDescription: "Envío Estándar",
+      deliveryEstimate: "3-5 días",
+      totalPrice: 13000
+    },
+    {
+      carrierDescription: "Motomensajería",
+      serviceDescription: "Envío Express (En el día)",
+      deliveryEstimate: "24hs",
+      totalPrice: 0,
+      customLabel: "A coordinar por WhatsApp"
+    }
+  ];
+
+  res.json({ rates: tarifasFijas });
+});
+
+app.get("/api/shipping/geocode/:postalCode", async (req, res) => {
+  res.json({ locality: "", state: { name: "" } });
+});
+
+// --- RUTAS DE CREACIÓN DE PEDIDOS ---
 app.post("/api/payment/create-preference", async (req, res) => {
   const { items, shippingCost, shippingDescription, customer } = req.body;
 
+  if (!items || !Array.isArray(items) || items.length === 0 || !customer) {
+    return res.status(400).json({ error: "Datos del pedido incompletos o inválidos" });
+  }
+
   try {
-    const totalProductos = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+    const totalProductos = items.reduce((sum, item) => sum + (Number(item.price) * Number(item.quantity)), 0);
     const total = totalProductos + Number(shippingCost || 0);
 
     const { data: orderData, error: orderError } = await supabase
@@ -247,14 +303,14 @@ app.post("/api/payment/create-preference", async (req, res) => {
       .select()
       .single();
 
-    if (orderError) throw new Error("Error en Supabase");
+    if (orderError) throw new Error("Error en la base de datos");
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
 
     const preferenceItems = items.map((item) => ({
-      title: item.name,
-      quantity: item.quantity,
+      title: String(item.name).substring(0, 256),
+      quantity: Number(item.quantity),
       unit_price: Number(item.price),
       currency_id: "ARS",
     }));
@@ -286,20 +342,23 @@ app.post("/api/payment/create-preference", async (req, res) => {
 
     res.json({ init_point: result.init_point });
   } catch (err) {
+    console.error("Error en create-preference:", err);
     res.status(500).json({ error: "No se pudo iniciar el pago" });
   }
 });
 
-// --- PAGO: crear pedido por transferencia bancaria (sin pasarela) ---
 app.post("/api/payment/create-transfer-order", async (req, res) => {
-  const { items, shippingCost, shippingDescription, customer } = req.body;
+  const { items, shippingCost, customer } = req.body;
+
+  if (!items || !Array.isArray(items) || items.length === 0 || !customer) {
+    return res.status(400).json({ error: "Datos de la orden inválidos" });
+  }
 
   try {
-    const totalProductos = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+    const totalProductos = items.reduce((sum, item) => sum + (Number(item.price) * Number(item.quantity)), 0);
     const descuento = Math.round(totalProductos * DESCUENTO_TRANSFERENCIA);
     const total = (totalProductos - descuento) + Number(shippingCost || 0);
 
-    // Se leen del panel admin (site_settings), no de variables de entorno fijas
     const datosTransferencia = await obtenerDatosTransferencia();
 
     const { data: orderData, error: orderError } = await supabase
@@ -323,7 +382,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
       .select()
       .single();
 
-    if (orderError) throw new Error("Error en Supabase");
+    if (orderError) throw new Error("Error registrando en Supabase");
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailTransferencia(orderData, datosTransferencia).catch(console.error);
@@ -339,8 +398,8 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
   }
 });
 
-// --- ADMIN: confirmar manualmente que llegó la transferencia ---
-app.patch("/api/admin/orders/:id/confirm-transfer", async (req, res) => {
+// --- RUTA ADMINISTRATIVA PROTEGIDA ---
+app.patch("/api/admin/orders/:id/confirm-transfer", requireAdminAuth, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -353,7 +412,7 @@ app.patch("/api/admin/orders/:id/confirm-transfer", async (req, res) => {
       .single();
 
     if (error || !data) {
-      return res.status(404).json({ error: "Pedido no encontrado o no es por transferencia" });
+      return res.status(404).json({ error: "Pedido no encontrado o no corresponde a transferencia" });
     }
 
     res.json(data);
@@ -363,41 +422,60 @@ app.patch("/api/admin/orders/:id/confirm-transfer", async (req, res) => {
   }
 });
 
-// --- WEBHOOK: MercadoPago avisa acá cuando cambia el estado de un pago ---
-// Esto es lo que permite que el pedido pase a "pagado" solo, sin que nadie
-// tenga que entrar al panel admin a cambiarlo a mano.
+// --- WEBHOOK SEGURA DE MERCADO PAGO ---
 app.post("/api/payment/webhook", async (req, res) => {
   try {
-    // MercadoPago manda el aviso de dos formas posibles según la config: por body (webhooks nuevos)
-    // o por query string (formato IPN viejo). Contemplamos las dos para no perder ninguna notificación.
+    // 1. Verificación opcional pero recomendada de firma HMAC de Mercado Pago
+    const xSignature = req.headers["x-signature"];
+    const xRequestId = req.headers["x-request-id"];
+
+    if (process.env.MP_SECRET_KEY && xSignature) {
+      const parts = xSignature.split(",");
+      let ts, hash;
+      parts.forEach(part => {
+        const [key, value] = part.split("=");
+        if (key && key.trim() === "ts") ts = value.trim();
+        if (key && key.trim() === "v1") hash = value.trim();
+      });
+
+      const dataID = req.query["data.id"] || req.body?.data?.id;
+      const manifest = `id:${dataID};request-id:${xRequestId};ts:${ts};`;
+      
+      const hmac = crypto.createHmac("sha256", process.env.MP_SECRET_KEY);
+      hmac.update(manifest);
+      const sha = hmac.digest("hex");
+
+      if (sha !== hash) {
+        console.warn("Intento de webhook no autorizado o con firma inválida.");
+        return res.sendStatus(200); // 200 para evitar retries de bots
+      }
+    }
+
     const topic = req.body?.type || req.query.type || req.query.topic;
     const paymentId = req.body?.data?.id || req.query["data.id"] || req.query.id;
 
     if (topic !== "payment" || !paymentId) {
-      // No es una notificación de pago (puede ser de otro tipo, ej. "merchant_order") — la ignoramos.
       return res.sendStatus(200);
     }
 
-    // Nunca confiamos ciegamente en lo que llega del webhook: le preguntamos a MercadoPago
-    // los datos reales de ese pago antes de tocar la base de datos.
+    // 2. Consulta directa a la API de Mercado Pago (Fuente de verdad)
     const mpResponse = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
       headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
     });
 
     if (!mpResponse.ok) {
       console.error("No se pudo consultar el pago en MercadoPago:", await mpResponse.text());
-      return res.sendStatus(200); // Respondemos 200 igual para que MP no reintente en loop infinito
+      return res.sendStatus(200);
     }
 
     const payment = await mpResponse.json();
     const identificador = payment.external_reference;
 
     if (!identificador) {
-      console.error("El pago de MercadoPago no trae external_reference, no se puede vincular a un pedido.");
+      console.error("El pago no contiene external_reference.");
       return res.sendStatus(200);
     }
 
-    // Traducción del estado de MercadoPago a los estados que ya usa tu panel admin
     const estadoMap = {
       approved: "pagado",
       pending: "pendiente",
@@ -415,17 +493,17 @@ app.post("/api/payment/webhook", async (req, res) => {
       .eq("identificador", identificador);
 
     if (error) {
-      console.error(`Error actualizando el pedido #${identificador} desde el webhook:`, error);
+      console.error(`Error actualizando el pedido #${identificador}:`, error);
     } else {
-      console.log(`✔ Pedido #${identificador} actualizado a estado: ${nuevoEstado}`);
+      console.log(`✔ Pedido #${identificador} actualizado a: ${nuevoEstado}`);
     }
 
     res.sendStatus(200);
   } catch (err) {
-    console.error("Error procesando webhook de MercadoPago:", err);
-    res.sendStatus(200); // Respondemos 200 igual: si devolvemos error, MP reintenta y puede duplicar el procesamiento
+    console.error("Error procesando webhook:", err);
+    res.sendStatus(200);
   }
 });
 
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Server corriendo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Servidor seguro corriendo en puerto ${PORT}`));
