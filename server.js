@@ -10,7 +10,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// 1. Middlewares iniciales
+// Middlewares
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -33,20 +33,17 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 2. Variables de Entorno y Clientes
+// Variables de entorno y clientes
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const SITE_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
 
-if (!MP_ACCESS_TOKEN) console.warn("⚠️ ADVERTENCIA: MP_ACCESS_TOKEN no configurado");
-if (!SUPABASE_URL || !SUPABASE_KEY) console.warn("⚠️ ADVERTENCIA: Credenciales de Supabase incompletas");
-
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
 const supabase = createClient(SUPABASE_URL || "", SUPABASE_KEY || "");
 
-// 3. Configuración Email Nodemailer
+// Configuración Nodemailer
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST || "smtp.gmail.com",
   port: Number(process.env.EMAIL_PORT) || 587,
@@ -57,7 +54,6 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Auxiliar: Obtener datos bancarios para transferencia
 async function obtenerDatosTransferencia() {
   try {
     const { data } = await supabase.from("settings").select("*").single();
@@ -77,7 +73,6 @@ async function obtenerDatosTransferencia() {
   }
 }
 
-// Auxiliares: Envío de Emails
 async function enviarEmailNotificacion(order) {
   if (!process.env.EMAIL_USER) return;
 
@@ -90,7 +85,7 @@ async function enviarEmailNotificacion(order) {
     to: process.env.ADMIN_EMAIL || process.env.EMAIL_USER,
     subject: `Nuevo pedido #${order.identificador} - ${order.nombre_del_cliente}`,
     text: `
-¡Se ha recibido un nuevo pedido!
+¡Nuevo pedido recibido!
 
 Número de Orden: #${order.identificador}
 Cliente: ${order.nombre_del_cliente}
@@ -105,8 +100,8 @@ Estado: ${order.estado}
 PRODUCTOS:
 ${productosTexto}
 
-Subtotal Envíos: $${Number(order.costo_de_envio).toLocaleString("es-AR")}
-Descuento Aplicado: -$${Number(order.descuento || 0).toLocaleString("es-AR")}
+Envío: $${Number(order.costo_de_envio).toLocaleString("es-AR")}
+Descuento: -$${Number(order.descuento || 0).toLocaleString("es-AR")}
 TOTAL FINAL: $${Number(order.total).toLocaleString("es-AR")}
     `,
   };
@@ -126,11 +121,8 @@ Hola ${order.nombre_del_cliente},
 
 ¡Gracias por tu compra! Tu pedido #${order.identificador} ha sido registrado exitosamente.
 
-Detalle del pago:
 Total: $${Number(order.total).toLocaleString("es-AR")}
 Método de Pago: Mercado Pago
-
-Te notificaremos por este medio cuando el pedido sea despachado.
     `,
   };
 
@@ -143,11 +135,11 @@ async function enviarEmailTransferencia(order, datosTransferencia) {
   const mailOptions = {
     from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
     to: order.email,
-    subject: `Datos de Transferencia Bancaria - Orden #${order.identificador}`,
+    subject: `Datos para Transferencia - Orden #${order.identificador}`,
     text: `
 Hola ${order.nombre_del_cliente},
 
-Gracias por tu compra. Para procesar tu pedido, realiza la transferencia con los datos detallados a continuación:
+Gracias por tu compra. Realiza la transferencia para completar tu pedido:
 
 Monto Total: $${Number(order.total).toLocaleString("es-AR")}
 
@@ -157,26 +149,25 @@ Datos Bancarios:
 - CBU: ${datosTransferencia.cbu}
 - Alias: ${datosTransferencia.alias}
 
-Por favor envía el comprobante respondiendo a este correo con el N° de Orden: #${order.identificador}.
+Responde a este email con el comprobante de pago e indicando el N° de Orden: #${order.identificador}.
     `,
   };
 
   return transporter.sendMail(mailOptions);
 }
 
-// 4. Endpoints de la API
+// Endpoints API
 
-// Healthcheck
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date() });
 });
 
-// Validar Cupón de Descuento
+// Validar Cupón
 app.post("/api/coupons/validate", async (req, res) => {
   const { code } = req.body;
 
   if (!code) {
-    return res.status(400).json({ error: "El código de cupón es requerido" });
+    return res.status(400).json({ error: "El código es requerido" });
   }
 
   try {
@@ -188,11 +179,11 @@ app.post("/api/coupons/validate", async (req, res) => {
       .single();
 
     if (error || !coupon) {
-      return res.status(404).json({ error: "Cupón no válido o expirado" });
+      return res.status(404).json({ error: "Cupón no válido o inactivo" });
     }
 
     if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
-      return res.status(400).json({ error: "El cupón ingresado ha expirado" });
+      return res.status(400).json({ error: "El cupón ha expirado" });
     }
 
     res.json({
@@ -201,11 +192,11 @@ app.post("/api/coupons/validate", async (req, res) => {
     });
   } catch (err) {
     console.error("Error al validar cupón:", err);
-    res.status(500).json({ error: "Error en el servidor al validar cupón" });
+    res.status(500).json({ error: "Error del servidor" });
   }
 });
 
-// Crear Preferencia de Mercado Pago
+// Mercado Pago Preference
 app.post("/api/payment/create-preference", async (req, res) => {
   const { items, shippingCost, shippingDescription, customer, couponCode } = req.body;
 
@@ -216,7 +207,6 @@ app.post("/api/payment/create-preference", async (req, res) => {
   try {
     const totalProductos = items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0);
 
-    // Re-validar el cupón desde la DB por seguridad
     let montoDescuento = 0;
     if (couponCode) {
       const { data: couponData } = await supabase
@@ -233,7 +223,6 @@ app.post("/api/payment/create-preference", async (req, res) => {
 
     const total = totalProductos - montoDescuento + Number(shippingCost || 0);
 
-    // Insertar la orden en Supabase
     const { data: orderData, error: orderError } = await supabase
       .from("orders")
       .insert({
@@ -255,15 +244,11 @@ app.post("/api/payment/create-preference", async (req, res) => {
       .select()
       .single();
 
-    if (orderError) {
-      console.error("Error BD Supabase:", orderError);
-      throw new Error("Error registrando la orden");
-    }
+    if (orderError) throw new Error("Error guardando orden en Supabase");
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
 
-    // Construcción de ítems para Mercado Pago
     const preferenceItems = items.map((item) => ({
       title: String(item.name).substring(0, 256),
       quantity: Number(item.quantity),
@@ -308,11 +293,11 @@ app.post("/api/payment/create-preference", async (req, res) => {
     res.json({ init_point: result.init_point });
   } catch (err) {
     console.error("Error en create-preference:", err);
-    res.status(500).json({ error: "No se pudo iniciar el proceso de pago" });
+    res.status(500).json({ error: "No se pudo iniciar el pago" });
   }
 });
 
-// Crear Orden por Transferencia Bancaria
+// Orden por Transferencia
 app.post("/api/payment/create-transfer-order", async (req, res) => {
   const { items, shippingCost, customer, couponCode } = req.body;
 
@@ -361,10 +346,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
       .select()
       .single();
 
-    if (orderError) {
-      console.error("Error BD Supabase:", orderError);
-      throw new Error("Error registrando la orden en BD");
-    }
+    if (orderError) throw new Error("Error registrando orden en Supabase");
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailTransferencia(orderData, datosTransferencia).catch(console.error);
@@ -376,11 +358,11 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
     });
   } catch (err) {
     console.error("Error creando pedido por transferencia:", err);
-    res.status(500).json({ error: "No se pudo registrar el pedido por transferencia" });
+    res.status(500).json({ error: "No se pudo registrar el pedido" });
   }
 });
 
-// Webhook de Mercado Pago
+// Webhook MP
 app.post("/api/payment/webhook", async (req, res) => {
   const { type, data, action } = req.body;
   const paymentId = data?.id || req.query["data.id"] || req.query.id;
@@ -399,23 +381,23 @@ app.post("/api/payment/webhook", async (req, res) => {
           .eq("identificador", paymentInfo.external_reference);
       }
     } catch (err) {
-      console.error("Error procesando Webhook MP:", err);
+      console.error("Error Webhook MP:", err);
     }
   }
 
   res.sendStatus(200);
 });
 
-// 5. Manejo global de rutas inexistentes y errores
+// Manejo de Errores
 app.use((req, res) => {
   res.status(404).json({ error: "Ruta no encontrada" });
 });
 
 app.use((err, req, res, next) => {
-  console.error("Error no controlado:", err.stack);
-  res.status(500).json({ error: "Error interno en el servidor" });
+  console.error("Error interno:", err);
+  res.status(500).json({ error: "Error en el servidor" });
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor ejecutándose correctamente en el puerto ${PORT}`);
+  console.log(`Servidor activo en el puerto ${PORT}`);
 });
