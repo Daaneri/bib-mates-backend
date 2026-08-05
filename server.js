@@ -245,7 +245,7 @@ async function enviarEmailTransferencia(orderData, datosTransferencia) {
   if (error) console.error("Error enviando email de transferencia:", error);
 }
 
-// --- RUTAS PÚBLICAS DE ENVÍO ---
+// --- RUTAS PÚBLICAS DE ENVÍO Y CUPONES ---
 app.post("/api/shipping/quote", async (req, res) => {
   const tarifasFijas = [
     {
@@ -268,6 +268,44 @@ app.post("/api/shipping/quote", async (req, res) => {
 
 app.get("/api/shipping/geocode/:postalCode", async (req, res) => {
   res.json({ locality: "", state: { name: "" } });
+});
+
+// Validación pública de cupón para el comprador
+app.post("/api/coupons/validate", async (req, res) => {
+  const { code } = req.body;
+
+  if (!code) {
+    return res.status(400).json({ error: "Debes ingresar un código de cupón" });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("coupons")
+      .select("*")
+      .eq("code", code.toUpperCase().trim())
+      .eq("is_active", true)
+      .single();
+
+    if (error || !data) {
+      return res.status(444).json({ error: "El cupón ingresado no es válido o está inactivo" });
+    }
+
+    if (data.expires_at && new Date(data.expires_at) < new Date()) {
+      return res.status(400).json({ error: "El cupón ha expirado" });
+    }
+
+    if (data.max_uses !== null && data.current_uses >= data.max_uses) {
+      return res.status(400).json({ error: "El cupón ha alcanzado el límite máximo de usos" });
+    }
+
+    res.json({
+      code: data.code,
+      discount_percentage: data.discount_percentage
+    });
+  } catch (err) {
+    console.error("Error validando cupón:", err);
+    res.status(500).json({ error: "Error al validar el cupón" });
+  }
 });
 
 // --- RUTAS DE CREACIÓN DE PEDIDOS ---
@@ -354,7 +392,6 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
   }
 
   try {
-    // Se toma el precio exacto que proviene del frontend según la lógica de transferencia/contado
     const totalProductos = items.reduce((sum, item) => sum + (Number(item.price) * Number(item.quantity)), 0);
     const total = totalProductos + Number(shippingCost || 0);
 
@@ -397,7 +434,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
   }
 });
 
-// --- RUTA ADMINISTRATIVA PROTEGIDA ---
+// --- RUTAS ADMINISTRATIVAS PROTEGIDAS ---
 app.patch("/api/admin/orders/:id/confirm-transfer", requireAdminAuth, async (req, res) => {
   const { id } = req.params;
 
@@ -418,6 +455,90 @@ app.patch("/api/admin/orders/:id/confirm-transfer", requireAdminAuth, async (req
   } catch (err) {
     console.error("Error confirmando transferencia:", err);
     res.status(500).json({ error: "No se pudo confirmar el pedido" });
+  }
+});
+
+// Obtener la lista de cupones
+app.get("/api/admin/coupons", requireAdminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("coupons")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error obteniendo cupones:", err);
+    res.status(500).json({ error: "No se pudieron obtener los cupones" });
+  }
+});
+
+// Crear un nuevo cupón
+app.post("/api/admin/coupons", requireAdminAuth, async (req, res) => {
+  const { code, discount_percentage, max_uses, expires_at } = req.body;
+
+  if (!code || !discount_percentage) {
+    return res.status(400).json({ error: "El código y el porcentaje son requeridos" });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("coupons")
+      .insert({
+        code: code.toUpperCase().trim(),
+        discount_percentage: Number(discount_percentage),
+        max_uses: max_uses ? Number(max_uses) : null,
+        expires_at: expires_at || null,
+        is_active: true
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    console.error("Error creando cupón:", err);
+    res.status(500).json({ error: "Error al crear el cupón (verifica que el código no exista)" });
+  }
+});
+
+// Activar o desactivar cupón
+app.patch("/api/admin/coupons/:id/toggle", requireAdminAuth, async (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body;
+
+  try {
+    const { data, error } = await supabase
+      .from("coupons")
+      .update({ is_active })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error modificando cupón:", err);
+    res.status(500).json({ error: "No se pudo actualizar el cupón" });
+  }
+});
+
+// Eliminar un cupón
+app.delete("/api/admin/coupons/:id", requireAdminAuth, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { error } = await supabase
+      .from("coupons")
+      .delete()
+      .eq("id", id);
+
+    if (error) throw error;
+    res.json({ message: "Cupón eliminado correctamente" });
+  } catch (err) {
+    console.error("Error eliminando cupón:", err);
+    res.status(500).json({ error: "No se pudo eliminar el cupón" });
   }
 });
 
