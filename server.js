@@ -35,8 +35,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // Variables de entorno y clientes
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const SITE_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
 
@@ -290,6 +288,9 @@ app.post("/api/payment/create-preference", async (req, res) => {
           pending: `${SITE_URL}/checkout/pendiente`,
         },
         auto_return: "approved",
+        payment_methods: {
+          installments: 3 // Fuerza a la preferencia de Mercado Pago a 3 cuotas máximo
+        }
       },
     });
 
