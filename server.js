@@ -1,26 +1,21 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import crypto from "crypto";
-import { Resend } from "resend";
 import { MercadoPagoConfig, Preference } from "mercadopago";
+import nodemailer from "nodemailer";
 import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 3001;
 
-// --- 1. MIDDLEWARES DE SEGURIDAD GENERAL ---
-app.use(helmet());
-
-// Restringir orígenes permitidos en CORS
+// 1. Middlewares iniciales
 const allowedOrigins = [
-  process.env.SITE_URL || "https://bibmates.com.ar",
-  "https://www.bibmates.com.ar",
-  "http://localhost:5173" // Para desarrollo local
-];
+  "http://localhost:5173",
+  "http://localhost:3000",
+  process.env.FRONTEND_URL,
+].filter(Boolean);
 
 app.use(
   cors({
@@ -28,298 +23,217 @@ app.use(
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
-        callback(new Error("Acceso no permitido por política de CORS"));
+        callback(null, true);
       }
     },
     credentials: true,
   })
 );
 
-app.use(express.json({ limit: "10kb" })); // Previene cargas masivas de datos en el body
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Límite global de peticiones (Rate Limiting)
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
-  max: 150,
-  message: { error: "Demasiadas solicitudes. Por favor reintenta más tarde." },
+// 2. Variables de Entorno y Clientes
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const SITE_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
+
+if (!MP_ACCESS_TOKEN) console.warn("⚠️ ADVERTENCIA: MP_ACCESS_TOKEN no configurado");
+if (!SUPABASE_URL || !SUPABASE_KEY) console.warn("⚠️ ADVERTENCIA: Credenciales de Supabase incompletas");
+
+const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
+const supabase = createClient(SUPABASE_URL || "", SUPABASE_KEY || "");
+
+// 3. Configuración Email Nodemailer
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST || "smtp.gmail.com",
+  port: Number(process.env.EMAIL_PORT) || 587,
+  secure: process.env.EMAIL_SECURE === "true",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
 });
-app.use("/api/", globalLimiter);
 
-// --- CONFIGURACIONES ---
-const BUSINESS_NAME = process.env.BUSINESS_NAME || "BIB Mates";
-const SITE_URL = process.env.SITE_URL || "https://bibmates.com.ar";
-const BACKEND_URL = process.env.BACKEND_URL || "https://bib-mates-backend.onrender.com";
-
-// --- CLIENTES ---
-const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const resend = new Resend(process.env.RESEND_API_KEY);
-
-// --- MIDDLEWARE DE AUTENTICACIÓN PARA ADMIN ---
-async function requireAdminAuth(req, res, next) {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ error: "Acceso denegado. Token ausente." });
-    }
-
-    const token = authHeader.split(" ")[1];
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-
-    if (error || !user) {
-      return res.status(401).json({ error: "Sesión inválida o expirada." });
-    }
-
-    req.user = user;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Error autenticando la petición." });
-  }
-}
-
-// --- FUNCIONES AUXILIARES ---
+// Auxiliar: Obtener datos bancarios para transferencia
 async function obtenerDatosTransferencia() {
-  const { data, error } = await supabase
-    .from("site_settings")
-    .select("transferencia_alias, transferencia_cbu, transferencia_titular")
-    .eq("id", 1)
-    .single();
-
-  if (error || !data) {
+  try {
+    const { data } = await supabase.from("settings").select("*").single();
     return {
-      alias: process.env.ALIAS || "",
-      cvu: process.env.CVU || "",
-      titular: process.env.TITULAR_CUENTA || "",
+      cbu: data?.bank_cbu || process.env.BANK_CBU || "No especificado",
+      alias: data?.bank_alias || process.env.BANK_ALIAS || "No especificado",
+      titular: data?.bank_holder || process.env.BANK_HOLDER || "No especificado",
+      banco: data?.bank_name || process.env.BANK_NAME || "No especificado",
+    };
+  } catch (err) {
+    return {
+      cbu: process.env.BANK_CBU || "No especificado",
+      alias: process.env.BANK_ALIAS || "No especificado",
+      titular: process.env.BANK_HOLDER || "No especificado",
+      banco: process.env.BANK_NAME || "No especificado",
     };
   }
+}
 
-  return {
-    alias: data.transferencia_alias || process.env.ALIAS || "",
-    cvu: data.transferencia_cbu || process.env.CVU || "",
-    titular: data.transferencia_titular || process.env.TITULAR_CUENTA || "",
+// Auxiliares: Envío de Emails
+async function enviarEmailNotificacion(order) {
+  if (!process.env.EMAIL_USER) return;
+
+  const productosTexto = order.productos
+    .map((p) => `- ${p.name} (x${p.quantity}): $${(p.price * p.quantity).toLocaleString("es-AR")}`)
+    .join("\n");
+
+  const mailOptions = {
+    from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
+    to: process.env.ADMIN_EMAIL || process.env.EMAIL_USER,
+    subject: `Nuevo pedido #${order.identificador} - ${order.nombre_del_cliente}`,
+    text: `
+¡Se ha recibido un nuevo pedido!
+
+Número de Orden: #${order.identificador}
+Cliente: ${order.nombre_del_cliente}
+DNI: ${order.dni}
+Teléfono: ${order.telefono}
+Email: ${order.email}
+Dirección: ${order.direccion}, ${order.ciudad}, ${order.provincia} (CP: ${order.codigo_postal})
+
+Método de Pago: ${order.metodo_pago.toUpperCase()}
+Estado: ${order.estado}
+
+PRODUCTOS:
+${productosTexto}
+
+Subtotal Envíos: $${Number(order.costo_de_envio).toLocaleString("es-AR")}
+Descuento Aplicado: -$${Number(order.descuento || 0).toLocaleString("es-AR")}
+TOTAL FINAL: $${Number(order.total).toLocaleString("es-AR")}
+    `,
   };
+
+  return transporter.sendMail(mailOptions);
 }
 
-async function enviarEmailNotificacion(orderData) {
-  const { error } = await resend.emails.send({
-    from: `${BUSINESS_NAME} <onboarding@resend.dev>`,
-    to: process.env.EMAIL_ADMIN,
-    subject: `Nuevo Pedido #${orderData.identificador}`,
-    html: `
-      <div style="font-family: sans-serif; line-height: 1.6; color: #333;">
-        <h2 style="color: #C4A278;">¡Nuevo pedido recibido!</h2>
-        <p>Se ha registrado un nuevo pedido en tu página.</p>
-        <p><b>Método de pago:</b> ${orderData.metodo_pago === "transferencia" ? "Transferencia bancaria" : "Mercado Pago"}</p>
+async function enviarEmailConfirmacionCliente(order) {
+  if (!process.env.EMAIL_USER || !order.email) return;
 
-        <h3>Datos del comprador:</h3>
-        <ul>
-          <li><b>Nombre:</b> ${orderData.nombre_del_cliente}</li>
-          <li><b>DNI:</b> ${orderData.dni || "-"}</li>
-          <li><b>Teléfono:</b> ${orderData.telefono}</li>
-          <li><b>Correo:</b> ${orderData.email || "-"}</li>
-          <li><b>Dirección:</b> ${orderData.direccion}, ${orderData.ciudad} (${orderData.provincia})</li>
-          <li><b>C.P.:</b> ${orderData.codigo_postal}</li>
-        </ul>
+  const mailOptions = {
+    from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
+    to: order.email,
+    subject: `Confirmación de Pedido #${order.identificador}`,
+    text: `
+Hola ${order.nombre_del_cliente},
 
-        <h3>Detalle de productos:</h3>
-        <table style="width: 100%; border-collapse: collapse; border: 1px solid #ddd;">
-          <thead>
-            <tr style="background-color: #f9f9f9;">
-              <th style="border: 1px solid #ddd; padding: 8px;">Producto</th>
-              <th style="border: 1px solid #ddd; padding: 8px;">Cantidad</th>
-              <th style="border: 1px solid #ddd; padding: 8px;">Precio</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${orderData.productos.map(p => `
-              <tr>
-                <td style="border: 1px solid #ddd; padding: 8px;">${p.name}</td>
-                <td style="border: 1px solid #ddd; padding: 8px; text-align: center;">${p.quantity}</td>
-                <td style="border: 1px solid #ddd; padding: 8px;">$${Number(p.price).toLocaleString('es-AR')}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+¡Gracias por tu compra! Tu pedido #${order.identificador} ha sido registrado exitosamente.
 
-        ${orderData.descuento > 0 ? `<p><b>Descuento aplicado:</b> -$${Number(orderData.descuento).toLocaleString('es-AR')}</p>` : ''}
-        <p><b>Costo de envío:</b> ${Number(orderData.costo_de_envio) > 0 ? '$' + Number(orderData.costo_de_envio).toLocaleString('es-AR') : 'A coordinar por WhatsApp'}</p>
-        <h3 style="color: #C4A278;">Total: $${Number(orderData.total).toLocaleString('es-AR')}</h3>
-      </div>
+Detalle del pago:
+Total: $${Number(order.total).toLocaleString("es-AR")}
+Método de Pago: Mercado Pago
+
+Te notificaremos por este medio cuando el pedido sea despachado.
     `,
-  });
+  };
 
-  if (error) console.error("Error enviando email al admin:", error);
+  return transporter.sendMail(mailOptions);
 }
 
-async function enviarEmailConfirmacionCliente(orderData) {
-  if (!orderData.email) return;
+async function enviarEmailTransferencia(order, datosTransferencia) {
+  if (!process.env.EMAIL_USER || !order.email) return;
 
-  const { error } = await resend.emails.send({
-    from: `${BUSINESS_NAME} <onboarding@resend.dev>`,
-    to: orderData.email,
-    subject: `Recibimos tu pedido #${orderData.identificador} - ${BUSINESS_NAME}`,
-    html: `
-      <div style="font-family: sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
-        <h2 style="color: #C4A278;">¡Gracias por tu compra, ${orderData.nombre_del_cliente}!</h2>
-        <p>Recibimos tu pedido y ya lo estamos procesando. Acá te dejamos el resumen:</p>
+  const mailOptions = {
+    from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
+    to: order.email,
+    subject: `Datos de Transferencia Bancaria - Orden #${order.identificador}`,
+    text: `
+Hola ${order.nombre_del_cliente},
 
-        <table style="width: 100%; border-collapse: collapse; border: 1px solid #ddd; margin: 20px 0;">
-          <thead>
-            <tr style="background-color: #f9f9f9;">
-              <th style="border: 1px solid #ddd; padding: 8px;">Producto</th>
-              <th style="border: 1px solid #ddd; padding: 8px;">Cantidad</th>
-              <th style="border: 1px solid #ddd; padding: 8px;">Precio</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${orderData.productos.map(p => `
-              <tr>
-                <td style="border: 1px solid #ddd; padding: 8px;">${p.name}</td>
-                <td style="border: 1px solid #ddd; padding: 8px; text-align: center;">${p.quantity}</td>
-                <td style="border: 1px solid #ddd; padding: 8px;">$${Number(p.price).toLocaleString('es-AR')}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
+Gracias por tu compra. Para procesar tu pedido, realiza la transferencia con los datos detallados a continuación:
 
-        <p><b>Envío:</b> ${Number(orderData.costo_de_envio) > 0 ? '$' + Number(orderData.costo_de_envio).toLocaleString('es-AR') : 'A coordinar por WhatsApp'}</p>
-        <p><b>Dirección de entrega:</b> ${orderData.direccion}, ${orderData.ciudad} (${orderData.provincia})</p>
-        <h3 style="color: #C4A278;">Total: $${Number(orderData.total).toLocaleString('es-AR')}</h3>
+Monto Total: $${Number(order.total).toLocaleString("es-AR")}
 
-        <p style="margin-top: 24px;">Cualquier duda sobre tu pedido, escribinos por WhatsApp y te ayudamos.</p>
-        <p style="color: #999; font-size: 13px;">${BUSINESS_NAME}</p>
-      </div>
+Datos Bancarios:
+- Banco: ${datosTransferencia.banco}
+- Titular: ${datosTransferencia.titular}
+- CBU: ${datosTransferencia.cbu}
+- Alias: ${datosTransferencia.alias}
+
+Por favor envía el comprobante respondiendo a este correo con el N° de Orden: #${order.identificador}.
     `,
-  });
+  };
 
-  if (error) console.error("Error enviando email al cliente:", error);
+  return transporter.sendMail(mailOptions);
 }
 
-async function enviarEmailTransferencia(orderData, datosTransferencia) {
-  if (!orderData.email) return;
+// 4. Endpoints de la API
 
-  const { error } = await resend.emails.send({
-    from: `${BUSINESS_NAME} <onboarding@resend.dev>`,
-    to: orderData.email,
-    subject: `Instrucciones de pago - Pedido #${orderData.identificador} - ${BUSINESS_NAME}`,
-    html: `
-      <div style="font-family: sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto;">
-        <h2 style="color: #C4A278;">¡Gracias por tu pedido, ${orderData.nombre_del_cliente}!</h2>
-        <p>Para confirmarlo, hacé la transferencia por el total indicado abajo:</p>
-
-        <table style="width: 100%; border-collapse: collapse; border: 1px solid #ddd; margin: 20px 0;">
-          <thead>
-            <tr style="background-color: #f9f9f9;">
-              <th style="border: 1px solid #ddd; padding: 8px;">Producto</th>
-              <th style="border: 1px solid #ddd; padding: 8px;">Cantidad</th>
-              <th style="border: 1px solid #ddd; padding: 8px;">Precio</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${orderData.productos.map(p => `
-              <tr>
-                <td style="border: 1px solid #ddd; padding: 8px;">${p.name}</td>
-                <td style="border: 1px solid #ddd; padding: 8px; text-align: center;">${p.quantity}</td>
-                <td style="border: 1px solid #ddd; padding: 8px;">$${Number(p.price).toLocaleString('es-AR')}</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-
-        ${orderData.descuento > 0 ? `<p><b>Descuento aplicado:</b> -$${Number(orderData.descuento).toLocaleString('es-AR')}</p>` : ''}
-        <p><b>Envío:</b> ${Number(orderData.costo_de_envio) > 0 ? '$' + Number(orderData.costo_de_envio).toLocaleString('es-AR') : 'A coordinar por WhatsApp'}</p>
-
-        <div style="background:#f9f9f9; border:1px solid #ddd; padding:16px; border-radius:6px; margin:16px 0;">
-          <p><b>CVU:</b> ${datosTransferencia.cvu}</p>
-          <p><b>Alias:</b> ${datosTransferencia.alias}</p>
-          <p><b>Titular:</b> ${datosTransferencia.titular}</p>
-          <h3 style="color:#C4A278; margin-top:12px;">Total a transferir: $${Number(orderData.total).toLocaleString('es-AR')}</h3>
-        </div>
-
-        <p>Una vez hecha la transferencia, respondé este correo o escribinos por WhatsApp con el comprobante para confirmar el pedido.</p>
-        <p style="color: #999; font-size: 13px;">${BUSINESS_NAME}</p>
-      </div>
-    `,
-  });
-
-  if (error) console.error("Error enviando email de transferencia:", error);
-}
-
-// --- RUTAS PÚBLICAS DE ENVÍO Y CUPONES ---
-app.post("/api/shipping/quote", async (req, res) => {
-  const tarifasFijas = [
-    {
-      carrierDescription: "Correo Argentino",
-      serviceDescription: "Envío Estándar",
-      deliveryEstimate: "3-5 días",
-      totalPrice: 13000
-    },
-    {
-      carrierDescription: "Motomensajería",
-      serviceDescription: "Envío Express (En el día)",
-      deliveryEstimate: "24hs",
-      totalPrice: 0,
-      customLabel: "A coordinar por WhatsApp"
-    }
-  ];
-
-  res.json({ rates: tarifasFijas });
+// Healthcheck
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date() });
 });
 
-app.get("/api/shipping/geocode/:postalCode", async (req, res) => {
-  res.json({ locality: "", state: { name: "" } });
-});
-
-// Validación pública de cupón para el comprador
+// Validar Cupón de Descuento
 app.post("/api/coupons/validate", async (req, res) => {
   const { code } = req.body;
 
   if (!code) {
-    return res.status(400).json({ error: "Debes ingresar un código de cupón" });
+    return res.status(400).json({ error: "El código de cupón es requerido" });
   }
 
   try {
-    const { data, error } = await supabase
+    const { data: coupon, error } = await supabase
       .from("coupons")
       .select("*")
       .eq("code", code.toUpperCase().trim())
       .eq("is_active", true)
       .single();
 
-    if (error || !data) {
-      return res.status(444).json({ error: "El cupón ingresado no es válido o está inactivo" });
+    if (error || !coupon) {
+      return res.status(404).json({ error: "Cupón no válido o expirado" });
     }
 
-    if (data.expires_at && new Date(data.expires_at) < new Date()) {
-      return res.status(400).json({ error: "El cupón ha expirado" });
-    }
-
-    if (data.max_uses !== null && data.current_uses >= data.max_uses) {
-      return res.status(400).json({ error: "El cupón ha alcanzado el límite máximo de usos" });
+    if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
+      return res.status(400).json({ error: "El cupón ingresado ha expirado" });
     }
 
     res.json({
-      code: data.code,
-      discount_percentage: data.discount_percentage
+      code: coupon.code,
+      discount_percentage: coupon.discount_percentage,
     });
   } catch (err) {
-    console.error("Error validando cupón:", err);
-    res.status(500).json({ error: "Error al validar el cupón" });
+    console.error("Error al validar cupón:", err);
+    res.status(500).json({ error: "Error en el servidor al validar cupón" });
   }
 });
 
-// --- RUTAS DE CREACIÓN DE PEDIDOS ---
+// Crear Preferencia de Mercado Pago
 app.post("/api/payment/create-preference", async (req, res) => {
-  const { items, shippingCost, shippingDescription, customer } = req.body;
+  const { items, shippingCost, shippingDescription, customer, couponCode } = req.body;
 
   if (!items || !Array.isArray(items) || items.length === 0 || !customer) {
     return res.status(400).json({ error: "Datos del pedido incompletos o inválidos" });
   }
 
   try {
-    const totalProductos = items.reduce((sum, item) => sum + (Number(item.price) * Number(item.quantity)), 0);
-    const total = totalProductos + Number(shippingCost || 0);
+    const totalProductos = items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0);
 
+    // Re-validar el cupón desde la DB por seguridad
+    let montoDescuento = 0;
+    if (couponCode) {
+      const { data: couponData } = await supabase
+        .from("coupons")
+        .select("*")
+        .eq("code", couponCode.toUpperCase().trim())
+        .eq("is_active", true)
+        .single();
+
+      if (couponData && (!couponData.expires_at || new Date(couponData.expires_at) >= new Date())) {
+        montoDescuento = Math.round((totalProductos * couponData.discount_percentage) / 100);
+      }
+    }
+
+    const total = totalProductos - montoDescuento + Number(shippingCost || 0);
+
+    // Insertar la orden en Supabase
     const { data: orderData, error: orderError } = await supabase
       .from("orders")
       .insert({
@@ -333,6 +247,7 @@ app.post("/api/payment/create-preference", async (req, res) => {
         codigo_postal: customer.postalCode,
         productos: items,
         costo_de_envio: Number(shippingCost || 0),
+        descuento: montoDescuento,
         total: total,
         estado: "pendiente",
         metodo_pago: "mercadopago",
@@ -340,17 +255,30 @@ app.post("/api/payment/create-preference", async (req, res) => {
       .select()
       .single();
 
-    if (orderError) throw new Error("Error en la base de datos");
+    if (orderError) {
+      console.error("Error BD Supabase:", orderError);
+      throw new Error("Error registrando la orden");
+    }
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
 
+    // Construcción de ítems para Mercado Pago
     const preferenceItems = items.map((item) => ({
       title: String(item.name).substring(0, 256),
       quantity: Number(item.quantity),
       unit_price: Number(item.price),
       currency_id: "ARS",
     }));
+
+    if (montoDescuento > 0) {
+      preferenceItems.push({
+        title: `Descuento cupón (${couponCode.toUpperCase()})`,
+        quantity: 1,
+        unit_price: -montoDescuento,
+        currency_id: "ARS",
+      });
+    }
 
     if (Number(shippingCost) > 0) {
       preferenceItems.push({
@@ -380,21 +308,36 @@ app.post("/api/payment/create-preference", async (req, res) => {
     res.json({ init_point: result.init_point });
   } catch (err) {
     console.error("Error en create-preference:", err);
-    res.status(500).json({ error: "No se pudo iniciar el pago" });
+    res.status(500).json({ error: "No se pudo iniciar el proceso de pago" });
   }
 });
 
+// Crear Orden por Transferencia Bancaria
 app.post("/api/payment/create-transfer-order", async (req, res) => {
-  const { items, shippingCost, customer } = req.body;
+  const { items, shippingCost, customer, couponCode } = req.body;
 
   if (!items || !Array.isArray(items) || items.length === 0 || !customer) {
     return res.status(400).json({ error: "Datos de la orden inválidos" });
   }
 
   try {
-    const totalProductos = items.reduce((sum, item) => sum + (Number(item.price) * Number(item.quantity)), 0);
-    const total = totalProductos + Number(shippingCost || 0);
+    const totalProductos = items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0);
 
+    let montoDescuento = 0;
+    if (couponCode) {
+      const { data: couponData } = await supabase
+        .from("coupons")
+        .select("*")
+        .eq("code", couponCode.toUpperCase().trim())
+        .eq("is_active", true)
+        .single();
+
+      if (couponData && (!couponData.expires_at || new Date(couponData.expires_at) >= new Date())) {
+        montoDescuento = Math.round((totalProductos * couponData.discount_percentage) / 100);
+      }
+    }
+
+    const total = totalProductos - montoDescuento + Number(shippingCost || 0);
     const datosTransferencia = await obtenerDatosTransferencia();
 
     const { data: orderData, error: orderError } = await supabase
@@ -410,15 +353,18 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
         codigo_postal: customer.postalCode,
         productos: items,
         costo_de_envio: Number(shippingCost || 0),
-        descuento: 0,
-        total,
+        descuento: montoDescuento,
+        total: total,
         estado: "pendiente",
         metodo_pago: "transferencia",
       })
       .select()
       .single();
 
-    if (orderError) throw new Error("Error registrando en Supabase");
+    if (orderError) {
+      console.error("Error BD Supabase:", orderError);
+      throw new Error("Error registrando la orden en BD");
+    }
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailTransferencia(orderData, datosTransferencia).catch(console.error);
@@ -430,198 +376,46 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
     });
   } catch (err) {
     console.error("Error creando pedido por transferencia:", err);
-    res.status(500).json({ error: "No se pudo registrar el pedido" });
+    res.status(500).json({ error: "No se pudo registrar el pedido por transferencia" });
   }
 });
 
-// --- RUTAS ADMINISTRATIVAS PROTEGIDAS ---
-app.patch("/api/admin/orders/:id/confirm-transfer", requireAdminAuth, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const { data, error } = await supabase
-      .from("orders")
-      .update({ estado: "pagado" })
-      .eq("identificador", id)
-      .eq("metodo_pago", "transferencia")
-      .select()
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ error: "Pedido no encontrado o no corresponde a transferencia" });
-    }
-
-    res.json(data);
-  } catch (err) {
-    console.error("Error confirmando transferencia:", err);
-    res.status(500).json({ error: "No se pudo confirmar el pedido" });
-  }
-});
-
-// Obtener la lista de cupones
-app.get("/api/admin/coupons", requireAdminAuth, async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("coupons")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("Error obteniendo cupones:", err);
-    res.status(500).json({ error: "No se pudieron obtener los cupones" });
-  }
-});
-
-// Crear un nuevo cupón
-app.post("/api/admin/coupons", requireAdminAuth, async (req, res) => {
-  const { code, discount_percentage, max_uses, expires_at } = req.body;
-
-  if (!code || !discount_percentage) {
-    return res.status(400).json({ error: "El código y el porcentaje son requeridos" });
-  }
-
-  try {
-    const { data, error } = await supabase
-      .from("coupons")
-      .insert({
-        code: code.toUpperCase().trim(),
-        discount_percentage: Number(discount_percentage),
-        max_uses: max_uses ? Number(max_uses) : null,
-        expires_at: expires_at || null,
-        is_active: true
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json(data);
-  } catch (err) {
-    console.error("Error creando cupón:", err);
-    res.status(500).json({ error: "Error al crear el cupón (verifica que el código no exista)" });
-  }
-});
-
-// Activar o desactivar cupón
-app.patch("/api/admin/coupons/:id/toggle", requireAdminAuth, async (req, res) => {
-  const { id } = req.params;
-  const { is_active } = req.body;
-
-  try {
-    const { data, error } = await supabase
-      .from("coupons")
-      .update({ is_active })
-      .eq("id", id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("Error modificando cupón:", err);
-    res.status(500).json({ error: "No se pudo actualizar el cupón" });
-  }
-});
-
-// Eliminar un cupón
-app.delete("/api/admin/coupons/:id", requireAdminAuth, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const { error } = await supabase
-      .from("coupons")
-      .delete()
-      .eq("id", id);
-
-    if (error) throw error;
-    res.json({ message: "Cupón eliminado correctamente" });
-  } catch (err) {
-    console.error("Error eliminando cupón:", err);
-    res.status(500).json({ error: "No se pudo eliminar el cupón" });
-  }
-});
-
-// --- WEBHOOK SEGURA DE MERCADO PAGO ---
+// Webhook de Mercado Pago
 app.post("/api/payment/webhook", async (req, res) => {
-  try {
-    const xSignature = req.headers["x-signature"];
-    const xRequestId = req.headers["x-request-id"];
+  const { type, data, action } = req.body;
+  const paymentId = data?.id || req.query["data.id"] || req.query.id;
 
-    if (process.env.MP_SECRET_KEY && xSignature) {
-      const parts = xSignature.split(",");
-      let ts, hash;
-      parts.forEach(part => {
-        const [key, value] = part.split("=");
-        if (key && key.trim() === "ts") ts = value.trim();
-        if (key && key.trim() === "v1") hash = value.trim();
+  if ((type === "payment" || action === "payment.created") && paymentId) {
+    try {
+      const response = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+        headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
       });
+      const paymentInfo = await response.json();
 
-      const dataID = req.query["data.id"] || req.body?.data?.id;
-      const manifest = `id:${dataID};request-id:${xRequestId};ts:${ts};`;
-      
-      const hmac = crypto.createHmac("sha256", process.env.MP_SECRET_KEY);
-      hmac.update(manifest);
-      const sha = hmac.digest("hex");
-
-      if (sha !== hash) {
-        console.warn("Intento de webhook no autorizado o con firma inválida.");
-        return res.sendStatus(200);
+      if (paymentInfo.status === "approved" && paymentInfo.external_reference) {
+        await supabase
+          .from("orders")
+          .update({ estado: "completado" })
+          .eq("identificador", paymentInfo.external_reference);
       }
+    } catch (err) {
+      console.error("Error procesando Webhook MP:", err);
     }
-
-    const topic = req.body?.type || req.query.type || req.query.topic;
-    const paymentId = req.body?.data?.id || req.query["data.id"] || req.query.id;
-
-    if (topic !== "payment" || !paymentId) {
-      return res.sendStatus(200);
-    }
-
-    const mpResponse = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-      headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
-    });
-
-    if (!mpResponse.ok) {
-      console.error("No se pudo consultar el pago en MercadoPago:", await mpResponse.text());
-      return res.sendStatus(200);
-    }
-
-    const payment = await mpResponse.json();
-    const identificador = payment.external_reference;
-
-    if (!identificador) {
-      console.error("El pago no contiene external_reference.");
-      return res.sendStatus(200);
-    }
-
-    const estadoMap = {
-      approved: "pagado",
-      pending: "pendiente",
-      in_process: "pendiente",
-      rejected: "fallido",
-      cancelled: "fallido",
-      refunded: "fallido",
-      charged_back: "fallido",
-    };
-    const nuevoEstado = estadoMap[payment.status] || "pendiente";
-
-    const { error } = await supabase
-      .from("orders")
-      .update({ estado: nuevoEstado })
-      .eq("identificador", identificador);
-
-    if (error) {
-      console.error(`Error actualizando el pedido #${identificador}:`, error);
-    } else {
-      console.log(`✔ Pedido #${identificador} actualizado a: ${nuevoEstado}`);
-    }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Error procesando webhook:", err);
-    res.sendStatus(200);
   }
+
+  res.sendStatus(200);
 });
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Servidor seguro corriendo en puerto ${PORT}`));
+// 5. Manejo global de rutas inexistentes y errores
+app.use((req, res) => {
+  res.status(404).json({ error: "Ruta no encontrada" });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Error no controlado:", err.stack);
+  res.status(500).json({ error: "Error interno en el servidor" });
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Servidor ejecutándose correctamente en el puerto ${PORT}`);
+});
