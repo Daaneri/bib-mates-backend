@@ -21,6 +21,30 @@ const mpClient = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKE
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// --- Trae los datos de transferencia cargados en el panel admin (site_settings) ---
+// Si por algún motivo no están cargados ahí, cae a las variables de entorno como respaldo.
+async function obtenerDatosTransferencia() {
+  const { data, error } = await supabase
+    .from("site_settings")
+    .select("transferencia_alias, transferencia_cbu, transferencia_titular")
+    .eq("id", 1)
+    .single();
+
+  if (error || !data) {
+    return {
+      alias: process.env.ALIAS || "",
+      cvu: process.env.CVU || "",
+      titular: process.env.TITULAR_CUENTA || "",
+    };
+  }
+
+  return {
+    alias: data.transferencia_alias || process.env.ALIAS || "",
+    cvu: data.transferencia_cbu || process.env.CVU || "",
+    titular: data.transferencia_titular || process.env.TITULAR_CUENTA || "",
+  };
+}
+
 // --- ENVIO: Tarifas fijas ---
 app.post("/api/shipping/quote", async (req, res) => {
   const tarifasFijas = [
@@ -145,7 +169,7 @@ async function enviarEmailConfirmacionCliente(orderData) {
 }
 
 // --- Email de instrucciones de transferencia al CLIENTE ---
-async function enviarEmailTransferencia(orderData) {
+async function enviarEmailTransferencia(orderData, datosTransferencia) {
   if (!orderData.email) return;
 
   const { error } = await resend.emails.send({
@@ -180,9 +204,9 @@ async function enviarEmailTransferencia(orderData) {
         <p><b>Envío:</b> ${Number(orderData.costo_de_envio) > 0 ? '$' + Number(orderData.costo_de_envio).toLocaleString('es-AR') : 'A coordinar por WhatsApp'}</p>
 
         <div style="background:#f9f9f9; border:1px solid #ddd; padding:16px; border-radius:6px; margin:16px 0;">
-          <p><b>CVU:</b> ${process.env.CVU}</p>
-          <p><b>Alias:</b> ${process.env.ALIAS}</p>
-          <p><b>Titular:</b> ${process.env.TITULAR_CUENTA}</p>
+          <p><b>CVU:</b> ${datosTransferencia.cvu}</p>
+          <p><b>Alias:</b> ${datosTransferencia.alias}</p>
+          <p><b>Titular:</b> ${datosTransferencia.titular}</p>
           <h3 style="color:#C4A278; margin-top:12px;">Total a transferir: $${Number(orderData.total).toLocaleString('es-AR')}</h3>
         </div>
 
@@ -275,6 +299,9 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
     const descuento = Math.round(totalProductos * DESCUENTO_TRANSFERENCIA);
     const total = (totalProductos - descuento) + Number(shippingCost || 0);
 
+    // Se leen del panel admin (site_settings), no de variables de entorno fijas
+    const datosTransferencia = await obtenerDatosTransferencia();
+
     const { data: orderData, error: orderError } = await supabase
       .from("orders")
       .insert({
@@ -299,16 +326,12 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
     if (orderError) throw new Error("Error en Supabase");
 
     enviarEmailNotificacion(orderData).catch(console.error);
-    enviarEmailTransferencia(orderData).catch(console.error);
+    enviarEmailTransferencia(orderData, datosTransferencia).catch(console.error);
 
     res.json({
       orderId: orderData.identificador,
       total,
-      datosTransferencia: {
-        cvu: process.env.CVU,
-        alias: process.env.ALIAS,
-        titular: process.env.TITULAR_CUENTA,
-      },
+      datosTransferencia,
     });
   } catch (err) {
     console.error("Error creando pedido por transferencia:", err);
