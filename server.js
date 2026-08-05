@@ -40,7 +40,7 @@ const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
 
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
 const DEFAULT_URL = process.env.SUPABASE_URL || "https://placeholder.supabase.co";
-const DEFAULT_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
+const DEFAULT_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
 
 const supabase = createClient(DEFAULT_URL, DEFAULT_KEY);
 
