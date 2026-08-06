@@ -10,11 +10,21 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Middlewares
+// --- CONFIGURACIÓN DE URLs tomadas de tus Variables de Render ---
+// Lee SITE_URL, le agrega https:// si no lo tiene y remueve la barra final
+const rawFrontendUrl = process.env.SITE_URL || process.env.FRONTEND_URL || "https://bibmates.com.ar";
+const SITE_URL = rawFrontendUrl.startsWith("http")
+  ? rawFrontendUrl.replace(/\/$/, "")
+  : `https://${rawFrontendUrl.replace(/\/$/, "")}`;
+
+const BACKEND_URL = (process.env.BACKEND_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
+
+// --- MIDDLEWARES ---
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
-  process.env.FRONTEND_URL,
+  "https://bibmates.com.ar",
+  SITE_URL,
 ].filter(Boolean);
 
 app.use(
@@ -33,18 +43,20 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Variables de entorno y clientes
+// --- CONFIGURACIÓN CLIENTES ---
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const SITE_URL = process.env.FRONTEND_URL || "http://localhost:5173";
-const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
-
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
+
 const DEFAULT_URL = process.env.SUPABASE_URL || "https://placeholder.supabase.co";
-const DEFAULT_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
+const DEFAULT_KEY =
+  process.env.SUPABASE_SERVICE_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
 
 const supabase = createClient(DEFAULT_URL, DEFAULT_KEY);
 
-// Configuración Nodemailer
+// --- CONFIGURACIÓN NODEMAILER ---
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST || "smtp.gmail.com",
   port: Number(process.env.EMAIL_PORT) || 587,
@@ -55,21 +67,22 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// --- FUNCIONES AUXILIARES CON MAPPING A TUS VARIABLES ---
 async function obtenerDatosTransferencia() {
   try {
     const { data } = await supabase.from("settings").select("*").single();
     return {
-      cbu: data?.bank_cbu || process.env.BANK_CBU || "No especificado",
-      alias: data?.bank_alias || process.env.BANK_ALIAS || "No especificado",
-      titular: data?.bank_holder || process.env.BANK_HOLDER || "No especificado",
-      banco: data?.bank_name || process.env.BANK_NAME || "No especificado",
+      cbu: data?.bank_cbu || process.env.CVU || process.env.BANK_CBU || "No especificado",
+      alias: data?.bank_alias || process.env.ALIAS || process.env.BANK_ALIAS || "No especificado",
+      titular: data?.bank_holder || process.env.TITULAR_CUENTA || process.env.BANK_HOLDER || "No especificado",
+      banco: data?.bank_name || process.env.BUSINESS_NAME || process.env.BANK_NAME || "No especificado",
     };
   } catch (err) {
     return {
-      cbu: process.env.BANK_CBU || "No especificado",
-      alias: process.env.BANK_ALIAS || "No especificado",
-      titular: process.env.BANK_HOLDER || "No especificado",
-      banco: process.env.BANK_NAME || "No especificado",
+      cbu: process.env.CVU || process.env.BANK_CBU || "No especificado",
+      alias: process.env.ALIAS || process.env.BANK_ALIAS || "No especificado",
+      titular: process.env.TITULAR_CUENTA || process.env.BANK_HOLDER || "No especificado",
+      banco: process.env.BUSINESS_NAME || process.env.BANK_NAME || "No especificado",
     };
   }
 }
@@ -81,9 +94,11 @@ async function enviarEmailNotificacion(order) {
     .map((p) => `- ${p.name} (x${p.quantity}): $${(p.price * p.quantity).toLocaleString("es-AR")}`)
     .join("\n");
 
+  const adminEmail = process.env.EMAIL_ADMIN || process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
+
   const mailOptions = {
-    from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
-    to: process.env.ADMIN_EMAIL || process.env.EMAIL_USER,
+    from: `"${process.env.BUSINESS_NAME || "BIB Mates"}" <${process.env.EMAIL_USER}>`,
+    to: adminEmail,
     subject: `Nuevo pedido #${order.identificador} - ${order.nombre_del_cliente}`,
     text: `
 ¡Nuevo pedido recibido!
@@ -114,13 +129,13 @@ async function enviarEmailConfirmacionCliente(order) {
   if (!process.env.EMAIL_USER || !order.email) return;
 
   const mailOptions = {
-    from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
+    from: `"${process.env.BUSINESS_NAME || "BIB Mates"}" <${process.env.EMAIL_USER}>`,
     to: order.email,
     subject: `Confirmación de Pedido #${order.identificador}`,
     text: `
 Hola ${order.nombre_del_cliente},
 
-¡Gracias por tu compra! Tu pedido #${order.identificador} ha sido registrado exitosamente.
+¡Gracias por tu compra en ${process.env.BUSINESS_NAME || "BIB Mates"}! Tu pedido #${order.identificador} ha sido registrado exitosamente.
 
 Total: $${Number(order.total).toLocaleString("es-AR")}
 Método de Pago: Mercado Pago / Tarjeta
@@ -134,30 +149,30 @@ async function enviarEmailTransferencia(order, datosTransferencia) {
   if (!process.env.EMAIL_USER || !order.email) return;
 
   const mailOptions = {
-    from: `"Mi Tienda" <${process.env.EMAIL_USER}>`,
+    from: `"${process.env.BUSINESS_NAME || "BIB Mates"}" <${process.env.EMAIL_USER}>`,
     to: order.email,
     subject: `Datos para Transferencia - Orden #${order.identificador}`,
     text: `
 Hola ${order.nombre_del_cliente},
 
-Gracias por tu compra. Realiza la transferencia para completar tu pedido:
+Gracias por tu compra en ${process.env.BUSINESS_NAME || "BIB Mates"}. Realiza la transferencia para completar tu pedido:
 
 Monto Total: $${Number(order.total).toLocaleString("es-AR")}
 
 Datos Bancarios:
-- Banco: ${datosTransferencia.banco}
+- Banco / Cuenta: ${datosTransferencia.banco}
 - Titular: ${datosTransferencia.titular}
-- CBU: ${datosTransferencia.cbu}
+- CBU/CVU: ${datosTransferencia.cbu}
 - Alias: ${datosTransferencia.alias}
 
-Responde a este email con el comprobante de pago e indicando el N° de Orden: #${order.identificador}.
+Por favor, responde a este email con el comprobante de pago e indicando el N° de Orden: #${order.identificador}.
     `,
   };
 
   return transporter.sendMail(mailOptions);
 }
 
-// Endpoints API
+// --- ENDPOINTS API ---
 
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date() });
@@ -197,7 +212,7 @@ app.post("/api/coupons/validate", async (req, res) => {
   }
 });
 
-// Mercado Pago Preference
+// Crear Preferencia de Pago en Mercado Pago
 app.post("/api/payment/create-preference", async (req, res) => {
   const { items, shippingCost, shippingDescription, customer, couponCode } = req.body;
 
@@ -224,6 +239,7 @@ app.post("/api/payment/create-preference", async (req, res) => {
 
     const total = Math.max(0, totalProductos - montoDescuento + Number(shippingCost || 0));
 
+    // Guardar orden en Supabase
     const { data: orderData, error: orderError } = await supabase
       .from("orders")
       .insert({
@@ -246,13 +262,14 @@ app.post("/api/payment/create-preference", async (req, res) => {
       .single();
 
     if (orderError) {
-      console.error("Error al insertar orden MP en Supabase:", orderError);
+      console.error("Error al insertar orden en Supabase:", orderError);
       throw new Error(`Supabase error: ${orderError.message}`);
     }
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
 
+    // Ajuste proporcional de ítems si hay cupones
     const discountFactor = totalProductos > 0 ? (totalProductos - montoDescuento) / totalProductos : 1;
 
     const preferenceItems = items.map((item) => {
@@ -274,22 +291,27 @@ app.post("/api/payment/create-preference", async (req, res) => {
       });
     }
 
+    // URLs absolutas construidas desde la variable SITE_URL de Render
+    const successUrl = `${SITE_URL}/checkout/exito`;
+    const failureUrl = `${SITE_URL}/checkout/error`;
+    const pendingUrl = `${SITE_URL}/checkout/pendiente`;
+
     const preference = new Preference(mpClient);
     const result = await preference.create({
       body: {
         items: preferenceItems,
-        payer: { name: customer.name, email: customer.email },
+        payer: {
+          name: customer.name,
+          email: customer.email,
+        },
         external_reference: orderData.identificador.toString(),
         notification_url: `${BACKEND_URL}/api/payment/webhook`,
         back_urls: {
-          success: `${SITE_URL}/checkout/exito`,
-          failure: `${SITE_URL}/checkout/error`,
-          pending: `${SITE_URL}/checkout/pendiente`,
+          success: successUrl,
+          failure: failureUrl,
+          pending: pendingUrl,
         },
         auto_return: "approved",
-        payment_methods: {
-          installments: 3,
-        },
       },
     });
 
@@ -300,7 +322,7 @@ app.post("/api/payment/create-preference", async (req, res) => {
   }
 });
 
-// Orden por Transferencia
+// Crear Orden por Transferencia
 app.post("/api/payment/create-transfer-order", async (req, res) => {
   const { items, shippingCost, customer, couponCode } = req.body;
 
@@ -368,7 +390,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
   }
 });
 
-// Webhook MP
+// Webhook de Mercado Pago
 app.post("/api/payment/webhook", async (req, res) => {
   const { type, data, action } = req.body;
   const paymentId = data?.id || req.query["data.id"] || req.query.id;
