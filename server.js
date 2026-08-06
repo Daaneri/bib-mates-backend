@@ -123,7 +123,7 @@ Hola ${order.nombre_del_cliente},
 ¡Gracias por tu compra! Tu pedido #${order.identificador} ha sido registrado exitosamente.
 
 Total: $${Number(order.total).toLocaleString("es-AR")}
-Método de Pago: Mercado Pago
+Método de Pago: Mercado Pago / Tarjeta
     `,
   };
 
