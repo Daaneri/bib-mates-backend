@@ -222,7 +222,7 @@ app.post("/api/payment/create-preference", async (req, res) => {
       }
     }
 
-    const total = totalProductos - montoDescuento + Number(shippingCost || 0);
+    const total = Math.max(0, totalProductos - montoDescuento + Number(shippingCost || 0));
 
     const { data: orderData, error: orderError } = await supabase
       .from("orders")
@@ -253,21 +253,18 @@ app.post("/api/payment/create-preference", async (req, res) => {
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
 
-    const preferenceItems = items.map((item) => ({
-      title: String(item.name).substring(0, 256),
-      quantity: Number(item.quantity),
-      unit_price: Number(item.price),
-      currency_id: "ARS",
-    }));
+    // Calcular factor de descuento proporcional (evita ítems negativos)
+    const discountFactor = totalProductos > 0 ? (totalProductos - montoDescuento) / totalProductos : 1;
 
-    if (montoDescuento > 0) {
-      preferenceItems.push({
-        title: `Descuento cupón (${couponCode.toUpperCase()})`,
-        quantity: 1,
-        unit_price: -montoDescuento,
+    const preferenceItems = items.map((item) => {
+      const adjustedPrice = Math.round(Number(item.price) * discountFactor * 100) / 100;
+      return {
+        title: String(item.name).substring(0, 256),
+        quantity: Number(item.quantity),
+        unit_price: Math.max(0.01, adjustedPrice),
         currency_id: "ARS",
-      });
-    }
+      };
+    });
 
     if (Number(shippingCost) > 0) {
       preferenceItems.push({
@@ -292,8 +289,8 @@ app.post("/api/payment/create-preference", async (req, res) => {
         },
         auto_return: "approved",
         payment_methods: {
-          installments: 3
-        }
+          installments: 3,
+        },
       },
     });
 
@@ -329,7 +326,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
       }
     }
 
-    const total = totalProductos - montoDescuento + Number(shippingCost || 0);
+    const total = Math.max(0, totalProductos - montoDescuento + Number(shippingCost || 0));
     const datosTransferencia = await obtenerDatosTransferencia();
 
     const { data: orderData, error: orderError } = await supabase
