@@ -10,8 +10,6 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// --- CONFIGURACIÓN DE URLs tomadas de tus Variables de Render ---
-// Lee SITE_URL, le agrega https:// si no lo tiene y remueve la barra final
 const rawFrontendUrl = process.env.SITE_URL || process.env.FRONTEND_URL || "https://bibmates.com.ar";
 const SITE_URL = rawFrontendUrl.startsWith("http")
   ? rawFrontendUrl.replace(/\/$/, "")
@@ -19,7 +17,6 @@ const SITE_URL = rawFrontendUrl.startsWith("http")
 
 const BACKEND_URL = (process.env.BACKEND_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
 
-// --- MIDDLEWARES ---
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -43,7 +40,6 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// --- CONFIGURACIÓN CLIENTES ---
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
 
@@ -56,7 +52,6 @@ const DEFAULT_KEY =
 
 const supabase = createClient(DEFAULT_URL, DEFAULT_KEY);
 
-// --- CONFIGURACIÓN NODEMAILER ---
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST || "smtp.gmail.com",
   port: Number(process.env.EMAIL_PORT) || 587,
@@ -67,7 +62,6 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// --- FUNCIONES AUXILIARES CON MAPPING A TUS VARIABLES ---
 async function obtenerDatosTransferencia() {
   try {
     const { data } = await supabase.from("settings").select("*").single();
@@ -85,6 +79,44 @@ async function obtenerDatosTransferencia() {
       banco: process.env.BUSINESS_NAME || process.env.BANK_NAME || "No especificado",
     };
   }
+}
+
+// Función de seguridad para calcular el precio real desde la Base de Datos
+async function calcularItemsConPrecioReal(items, paymentMethod) {
+  const verifiedItems = [];
+  let totalProductos = 0;
+
+  for (const item of items) {
+    const { data: dbProduct, error } = await supabase
+      .from("products")
+      .select("id, name, price, price_cash")
+      .eq("id", item.id)
+      .single();
+
+    if (error || !dbProduct) {
+      throw new Error(`Producto con ID ${item.id} no encontrado en la base de datos.`);
+    }
+
+    const basePrice = Number(dbProduct.price) || 0;
+    const cashPrice = dbProduct.price_cash && Number(dbProduct.price_cash) > 0 ? Number(dbProduct.price_cash) : basePrice;
+
+    // Si es transferencia usa price_cash, de lo contrario precio de lista normal
+    const unitPrice = paymentMethod === "transferencia" ? cashPrice : basePrice;
+    const quantity = Number(item.quantity) || 1;
+
+    totalProductos += unitPrice * quantity;
+
+    verifiedItems.push({
+      id: dbProduct.id,
+      name: dbProduct.name,
+      quantity: quantity,
+      price: unitPrice,
+      originalPrice: basePrice,
+      price_cash: cashPrice
+    });
+  }
+
+  return { verifiedItems, totalProductos };
 }
 
 async function enviarEmailNotificacion(order) {
@@ -172,13 +204,10 @@ Por favor, responde a este email con el comprobante de pago e indicando el N° d
   return transporter.sendMail(mailOptions);
 }
 
-// --- ENDPOINTS API ---
-
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date() });
 });
 
-// Validar Cupón
 app.post("/api/coupons/validate", async (req, res) => {
   const { code } = req.body;
 
@@ -221,7 +250,7 @@ app.post("/api/payment/create-preference", async (req, res) => {
   }
 
   try {
-    const totalProductos = items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0);
+    const { verifiedItems, totalProductos } = await calcularItemsConPrecioReal(items, "mercadopago");
 
     let montoDescuento = 0;
     if (couponCode) {
@@ -239,7 +268,6 @@ app.post("/api/payment/create-preference", async (req, res) => {
 
     const total = Math.max(0, totalProductos - montoDescuento + Number(shippingCost || 0));
 
-    // Guardar orden en Supabase
     const { data: orderData, error: orderError } = await supabase
       .from("orders")
       .insert({
@@ -251,7 +279,7 @@ app.post("/api/payment/create-preference", async (req, res) => {
         ciudad: customer.city || "",
         provincia: customer.state || "",
         codigo_postal: customer.postalCode || "",
-        productos: items,
+        productos: verifiedItems,
         costo_de_envio: Number(shippingCost || 0),
         descuento: montoDescuento,
         total: total,
@@ -269,10 +297,9 @@ app.post("/api/payment/create-preference", async (req, res) => {
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
 
-    // Ajuste proporcional de ítems si hay cupones
     const discountFactor = totalProductos > 0 ? (totalProductos - montoDescuento) / totalProductos : 1;
 
-    const preferenceItems = items.map((item) => {
+    const preferenceItems = verifiedItems.map((item) => {
       const adjustedPrice = Math.round(Number(item.price) * discountFactor * 100) / 100;
       return {
         title: String(item.name).substring(0, 256),
@@ -291,7 +318,6 @@ app.post("/api/payment/create-preference", async (req, res) => {
       });
     }
 
-    // URLs absolutas construidas desde la variable SITE_URL de Render
     const successUrl = `${SITE_URL}/checkout/exito`;
     const failureUrl = `${SITE_URL}/checkout/error`;
     const pendingUrl = `${SITE_URL}/checkout/pendiente`;
@@ -331,7 +357,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
   }
 
   try {
-    const totalProductos = items.reduce((sum, item) => sum + Number(item.price) * Number(item.quantity), 0);
+    const { verifiedItems, totalProductos } = await calcularItemsConPrecioReal(items, "transferencia");
 
     let montoDescuento = 0;
     if (couponCode) {
@@ -361,7 +387,7 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
         ciudad: customer.city || "",
         provincia: customer.state || "",
         codigo_postal: customer.postalCode || "",
-        productos: items,
+        productos: verifiedItems,
         costo_de_envio: Number(shippingCost || 0),
         descuento: montoDescuento,
         total: total,
@@ -416,7 +442,6 @@ app.post("/api/payment/webhook", async (req, res) => {
   res.sendStatus(200);
 });
 
-// Manejo de Errores
 app.use((req, res) => {
   res.status(404).json({ error: "Ruta no encontrada" });
 });
