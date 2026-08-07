@@ -241,6 +241,184 @@ app.post("/api/coupons/validate", async (req, res) => {
   }
 });
 
+// ==========================================================
+// MIDDLEWARE DE AUTENTICACIÓN ADMIN
+// Verifica el token de sesión de Supabase Auth (el mismo que
+// usa el login del panel). Cualquier usuario logueado en
+// Supabase Auth es admin, porque los clientes de la tienda
+// no se registran ahí.
+// ==========================================================
+async function verificarAdmin(req, res, next) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ error: "No autorizado" });
+  }
+
+  const { data, error } = await supabase.auth.getUser(token);
+
+  if (error || !data?.user) {
+    return res.status(401).json({ error: "Sesión inválida o expirada" });
+  }
+
+  req.user = data.user;
+  next();
+}
+
+// ==========================================================
+// RUTAS ADMIN - CUPONES (antes no existían, por eso tiraba
+// "Ruta no encontrada" en el panel)
+// ==========================================================
+app.get("/api/admin/coupons", verificarAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("coupons")
+      .select("*")
+      .order("id", { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error al obtener cupones:", err);
+    res.status(500).json({ error: "Error del servidor" });
+  }
+});
+
+app.post("/api/admin/coupons", verificarAdmin, async (req, res) => {
+  const { code, discount_percentage, max_uses, expires_at } = req.body;
+
+  if (!code || !discount_percentage) {
+    return res.status(400).json({ error: "Código y descuento son requeridos" });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("coupons")
+      .insert({
+        code: code.toUpperCase().trim(),
+        discount_percentage: Number(discount_percentage),
+        max_uses: max_uses ? Number(max_uses) : null,
+        expires_at: expires_at || null,
+        is_active: true,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error al crear cupón:", err);
+    res.status(500).json({ error: err.message || "No se pudo crear el cupón" });
+  }
+});
+
+app.patch("/api/admin/coupons/:id/toggle", verificarAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { is_active } = req.body;
+
+  try {
+    const { error } = await supabase
+      .from("coupons")
+      .update({ is_active })
+      .eq("id", id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error al cambiar estado del cupón:", err);
+    res.status(500).json({ error: "Error del servidor" });
+  }
+});
+
+app.delete("/api/admin/coupons/:id", verificarAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { error } = await supabase.from("coupons").delete().eq("id", id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error al eliminar cupón:", err);
+    res.status(500).json({ error: "Error del servidor" });
+  }
+});
+
+// ==========================================================
+// RUTAS - FAQS
+// GET /api/faqs es pública (la usa el modal en la tienda)
+// El resto requiere sesión admin
+// ==========================================================
+app.get("/api/faqs", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("faqs")
+      .select("*")
+      .order("id", { ascending: true });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error al obtener FAQs:", err);
+    res.status(500).json({ error: "Error del servidor" });
+  }
+});
+
+app.post("/api/admin/faqs", verificarAdmin, async (req, res) => {
+  const { question, answer } = req.body;
+
+  if (!question || !answer) {
+    return res.status(400).json({ error: "Pregunta y respuesta son requeridas" });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from("faqs")
+      .insert({ question: question.trim(), answer: answer.trim() })
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error al crear FAQ:", err);
+    res.status(500).json({ error: err.message || "No se pudo crear la FAQ" });
+  }
+});
+
+app.patch("/api/admin/faqs/:id", verificarAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { question, answer } = req.body;
+
+  try {
+    const { data, error } = await supabase
+      .from("faqs")
+      .update({ question, answer })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error al editar FAQ:", err);
+    res.status(500).json({ error: "Error del servidor" });
+  }
+});
+
+app.delete("/api/admin/faqs/:id", verificarAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const { error } = await supabase.from("faqs").delete().eq("id", id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Error al eliminar FAQ:", err);
+    res.status(500).json({ error: "Error del servidor" });
+  }
+});
+
 // Crear Preferencia de Pago en Mercado Pago
 app.post("/api/payment/create-preference", async (req, res) => {
   const { items, shippingCost, shippingDescription, customer, couponCode } = req.body;
