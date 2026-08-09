@@ -541,6 +541,10 @@ app.post("/api/payment/create-preference", async (req, res) => {
           pending: pendingUrl,
         },
         auto_return: "approved",
+        payment_methods: {
+          installments: 3,
+          default_installments: 3,
+        },
       },
     });
 
