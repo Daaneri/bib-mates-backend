@@ -23,6 +23,7 @@ const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
   "https://bibmates.com.ar",
+  "https://www.bibmates.com.ar",
   SITE_URL,
 ].filter(Boolean);
 
@@ -31,7 +32,8 @@ app.use(helmet());
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
+      const esVercelPreview = origin && /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin);
+      if (!origin || allowedOrigins.includes(origin) || esVercelPreview) {
         callback(null, true);
       } else {
         callback(new Error("No autorizado por CORS"));
