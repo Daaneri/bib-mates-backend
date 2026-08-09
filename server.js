@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { MercadoPagoConfig, Preference } from "mercadopago";
 import nodemailer from "nodemailer";
 import { createClient } from "@supabase/supabase-js";
@@ -24,18 +26,39 @@ const allowedOrigins = [
   SITE_URL,
 ].filter(Boolean);
 
+app.use(helmet());
+
 app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin || allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
-        callback(null, true);
+        callback(new Error("No autorizado por CORS"));
       }
     },
     credentials: true,
   })
 );
+
+// Límite general: 300 pedidos cada 15 min por IP, para frenar abuso/bots
+const limiterGeneral = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiterGeneral);
+
+// Límite más estricto en las rutas de pago, para evitar spam de órdenes falsas
+const limiterPagos = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiados intentos, esperá unos minutos y volvé a intentar." },
+});
+app.use("/api/payment", limiterPagos);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
