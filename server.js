@@ -88,7 +88,7 @@ async function calcularItemsConPrecioReal(items, paymentMethod) {
 
   for (const item of items) {
     const { data: dbProduct, error } = await supabase
-      .from("products")
+      .from("productos")
       .select("id, name, price, price_cash")
       .eq("id", item.id)
       .single();
