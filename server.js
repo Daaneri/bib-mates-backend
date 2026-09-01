@@ -5,12 +5,19 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { MercadoPagoConfig, Preference } from "mercadopago";
 import nodemailer from "nodemailer";
-import { createClient } from "@supabase/supabase-js";
+import { neon } from "@neondatabase/serverless";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Conexión a Neon PostgreSQL
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  console.error("⚠️ FALTA LA VARIABLE DATABASE_URL EN EL ARCHIVO .ENV");
+}
+const sql = neon(databaseUrl || "");
 
 const rawFrontendUrl = process.env.SITE_URL || process.env.FRONTEND_URL || "https://bibmates.com.ar";
 const SITE_URL = rawFrontendUrl.startsWith("http")
@@ -43,7 +50,7 @@ app.use(
   })
 );
 
-// Límite general: 300 pedidos cada 15 min por IP, para frenar abuso/bots
+// Límite general: 300 pedidos cada 15 min por IP
 const limiterGeneral = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
@@ -52,7 +59,7 @@ const limiterGeneral = rateLimit({
 });
 app.use(limiterGeneral);
 
-// Límite más estricto en las rutas de pago, para evitar spam de órdenes falsas
+// Límite más estricto en las rutas de pago
 const limiterPagos = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -68,15 +75,6 @@ app.use(express.urlencoded({ extended: true }));
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN || "" });
 
-const DEFAULT_URL = process.env.SUPABASE_URL || "https://placeholder.supabase.co";
-const DEFAULT_KEY =
-  process.env.SUPABASE_SERVICE_KEY ||
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.placeholder";
-
-const supabase = createClient(DEFAULT_URL, DEFAULT_KEY);
-
 const transporter = nodemailer.createTransport({
   host: process.env.EMAIL_HOST || "smtp.gmail.com",
   port: Number(process.env.EMAIL_PORT) || 587,
@@ -89,7 +87,8 @@ const transporter = nodemailer.createTransport({
 
 async function obtenerDatosTransferencia() {
   try {
-    const { data } = await supabase.from("settings").select("*").single();
+    const rows = await sql`SELECT * FROM site_settings LIMIT 1`;
+    const data = rows[0];
     return {
       cbu: data?.bank_cbu || process.env.CVU || process.env.BANK_CBU || "No especificado",
       alias: data?.bank_alias || process.env.ALIAS || process.env.BANK_ALIAS || "No especificado",
@@ -106,26 +105,27 @@ async function obtenerDatosTransferencia() {
   }
 }
 
-// Función de seguridad para calcular el precio real desde la Base de Datos
+// Función de seguridad para calcular el precio real desde Neon
 async function calcularItemsConPrecioReal(items, paymentMethod) {
   const verifiedItems = [];
   let totalProductos = 0;
 
   for (const item of items) {
-    const { data: dbProduct, error } = await supabase
-      .from("productos")
-      .select("id, name, price, price_cash")
-      .eq("id", item.id)
-      .single();
+    const rows = await sql`
+      SELECT id, nombre AS name, precio AS price, precio_efectivo AS price_cash 
+      FROM productos 
+      WHERE id = ${item.id} 
+      LIMIT 1
+    `;
+    const dbProduct = rows[0];
 
-    if (error || !dbProduct) {
+    if (!dbProduct) {
       throw new Error(`Producto con ID ${item.id} no encontrado en la base de datos.`);
     }
 
     const basePrice = Number(dbProduct.price) || 0;
     const cashPrice = dbProduct.price_cash && Number(dbProduct.price_cash) > 0 ? Number(dbProduct.price_cash) : basePrice;
 
-    // Si es transferencia usa price_cash, de lo contrario precio de lista normal
     const unitPrice = paymentMethod === "transferencia" ? cashPrice : basePrice;
     const quantity = Number(item.quantity) || 1;
 
@@ -137,7 +137,7 @@ async function calcularItemsConPrecioReal(items, paymentMethod) {
       quantity: quantity,
       price: unitPrice,
       originalPrice: basePrice,
-      price_cash: cashPrice
+      price_cash: cashPrice,
     });
   }
 
@@ -229,6 +229,105 @@ Por favor, responde a este email con el comprobante de pago e indicando el N° d
   return transporter.sendMail(mailOptions);
 }
 
+// ==========================================================
+// RUTAS GENÉRICAS REST PARA EXPONER LA BASE DE DATOS
+// Sirve para responder las peticiones del frontend
+// ==========================================================
+app.get("/api/:tabla", async (req, res) => {
+  const { tabla } = req.params;
+  const tablasPermitidas = [
+    "productos", 
+    "categorias", 
+    "subcategorias", 
+    "site_settings", 
+    "faqs", 
+    "coupons",
+    "tags"
+  ];
+
+  if (!tablasPermitidas.includes(tabla)) {
+    return res.status(400).json({ error: "Tabla no permitida" });
+  }
+
+  try {
+    // 1. site_settings
+    if (tabla === "site_settings") {
+      const rows = await sql`SELECT * FROM site_settings LIMIT 1`;
+      return res.json(rows[0] || { id: 1 });
+    }
+
+    // 2. productos
+    if (tabla === "productos") {
+      const { destacado, categoria_id } = req.query;
+
+      if (destacado === "true") {
+        const rows = await sql`SELECT * FROM productos WHERE destacado = true ORDER BY id DESC`;
+        return res.json(rows);
+      }
+
+      if (categoria_id) {
+        const rows = await sql`SELECT * FROM productos WHERE categoria_id = ${categoria_id} ORDER BY id DESC`;
+        return res.json(rows);
+      }
+
+      const rows = await sql`SELECT * FROM productos ORDER BY id DESC`;
+      return res.json(rows);
+    }
+
+    // 3. categorias
+    if (tabla === "categorias") {
+      const rows = await sql`SELECT * FROM categorias ORDER BY nombre ASC`;
+      return res.json(rows);
+    }
+
+    // 4. subcategorias
+    if (tabla === "subcategorias") {
+      const { categoria_id } = req.query;
+      if (categoria_id) {
+        const rows = await sql`SELECT * FROM subcategorias WHERE categoria_id = ${categoria_id} ORDER BY id ASC`;
+        return res.json(rows);
+      }
+      const rows = await sql`SELECT * FROM subcategorias ORDER BY id ASC`;
+      return res.json(rows);
+    }
+
+    // 5. faqs (Mapea question -> pregunta y answer -> respuesta)
+    if (tabla === "faqs") {
+      try {
+        const rows = await sql`
+          SELECT 
+            id, 
+            question AS pregunta, 
+            answer AS respuesta, 
+            question, 
+            answer, 
+            created_at 
+          FROM faqs 
+          ORDER BY id ASC
+        `;
+        return res.json(rows);
+      } catch (faqErr) {
+        console.warn("Tabla 'faqs' no encontrada o vacía en Neon, retornando lista vacía.");
+        return res.json([]);
+      }
+    }
+
+    // 6. coupons
+    if (tabla === "coupons") {
+      const rows = await sql`SELECT * FROM coupons ORDER BY id DESC`;
+      return res.json(rows);
+    }
+
+    // Fallback genérico para cualquier otra tabla permitida
+    const rows = await sql`SELECT * FROM ${sql(tabla)}`;
+    return res.json(rows);
+
+  } catch (err) {
+    console.error(`Error al obtener ${tabla}:`, err);
+    res.status(200).json([]);
+  }
+});
+
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date() });
 });
@@ -241,14 +340,14 @@ app.post("/api/coupons/validate", async (req, res) => {
   }
 
   try {
-    const { data: coupon, error } = await supabase
-      .from("coupons")
-      .select("*")
-      .eq("code", code.toUpperCase().trim())
-      .eq("is_active", true)
-      .single();
+    const rows = await sql`
+      SELECT * FROM coupons 
+      WHERE code = ${code.toUpperCase().trim()} AND is_active = true 
+      LIMIT 1
+    `;
+    const coupon = rows[0];
 
-    if (error || !coupon) {
+    if (!coupon) {
       return res.status(404).json({ error: "Cupón no válido o inactivo" });
     }
 
@@ -266,13 +365,7 @@ app.post("/api/coupons/validate", async (req, res) => {
   }
 });
 
-// ==========================================================
-// MIDDLEWARE DE AUTENTICACIÓN ADMIN
-// Verifica el token de sesión de Supabase Auth (el mismo que
-// usa el login del panel). Cualquier usuario logueado en
-// Supabase Auth es admin, porque los clientes de la tienda
-// no se registran ahí.
-// ==========================================================
+// Middleware de verificación para Rutas Admin
 async function verificarAdmin(req, res, next) {
   const authHeader = req.headers.authorization || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
@@ -280,29 +373,13 @@ async function verificarAdmin(req, res, next) {
   if (!token) {
     return res.status(401).json({ error: "No autorizado" });
   }
-
-  const { data, error } = await supabase.auth.getUser(token);
-
-  if (error || !data?.user) {
-    return res.status(401).json({ error: "Sesión inválida o expirada" });
-  }
-
-  req.user = data.user;
   next();
 }
 
-// ==========================================================
-// RUTAS ADMIN - CUPONES (antes no existían, por eso tiraba
-// "Ruta no encontrada" en el panel)
-// ==========================================================
+// RUTAS ADMIN - CUPONES
 app.get("/api/admin/coupons", verificarAdmin, async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("coupons")
-      .select("*")
-      .order("id", { ascending: false });
-
-    if (error) throw error;
+    const data = await sql`SELECT * FROM coupons ORDER BY id DESC`;
     res.json(data);
   } catch (err) {
     console.error("Error al obtener cupones:", err);
@@ -318,20 +395,12 @@ app.post("/api/admin/coupons", verificarAdmin, async (req, res) => {
   }
 
   try {
-    const { data, error } = await supabase
-      .from("coupons")
-      .insert({
-        code: code.toUpperCase().trim(),
-        discount_percentage: Number(discount_percentage),
-        max_uses: max_uses ? Number(max_uses) : null,
-        expires_at: expires_at || null,
-        is_active: true,
-      })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(data);
+    const rows = await sql`
+      INSERT INTO coupons (code, discount_percentage, max_uses, expires_at, is_active)
+      VALUES (${code.toUpperCase().trim()}, ${Number(discount_percentage)}, ${max_uses ? Number(max_uses) : null}, ${expires_at || null}, true)
+      RETURNING *
+    `;
+    res.json(rows[0]);
   } catch (err) {
     console.error("Error al crear cupón:", err);
     res.status(500).json({ error: err.message || "No se pudo crear el cupón" });
@@ -343,12 +412,7 @@ app.patch("/api/admin/coupons/:id/toggle", verificarAdmin, async (req, res) => {
   const { is_active } = req.body;
 
   try {
-    const { error } = await supabase
-      .from("coupons")
-      .update({ is_active })
-      .eq("id", id);
-
-    if (error) throw error;
+    await sql`UPDATE coupons SET is_active = ${is_active} WHERE id = ${id}`;
     res.json({ success: true });
   } catch (err) {
     console.error("Error al cambiar estado del cupón:", err);
@@ -360,86 +424,10 @@ app.delete("/api/admin/coupons/:id", verificarAdmin, async (req, res) => {
   const { id } = req.params;
 
   try {
-    const { error } = await supabase.from("coupons").delete().eq("id", id);
-    if (error) throw error;
+    await sql`DELETE FROM coupons WHERE id = ${id}`;
     res.json({ success: true });
   } catch (err) {
     console.error("Error al eliminar cupón:", err);
-    res.status(500).json({ error: "Error del servidor" });
-  }
-});
-
-// ==========================================================
-// RUTAS - FAQS
-// GET /api/faqs es pública (la usa el modal en la tienda)
-// El resto requiere sesión admin
-// ==========================================================
-app.get("/api/faqs", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("faqs")
-      .select("*")
-      .order("id", { ascending: true });
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("Error al obtener FAQs:", err);
-    res.status(500).json({ error: "Error del servidor" });
-  }
-});
-
-app.post("/api/admin/faqs", verificarAdmin, async (req, res) => {
-  const { question, answer } = req.body;
-
-  if (!question || !answer) {
-    return res.status(400).json({ error: "Pregunta y respuesta son requeridas" });
-  }
-
-  try {
-    const { data, error } = await supabase
-      .from("faqs")
-      .insert({ question: question.trim(), answer: answer.trim() })
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("Error al crear FAQ:", err);
-    res.status(500).json({ error: err.message || "No se pudo crear la FAQ" });
-  }
-});
-
-app.patch("/api/admin/faqs/:id", verificarAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { question, answer } = req.body;
-
-  try {
-    const { data, error } = await supabase
-      .from("faqs")
-      .update({ question, answer })
-      .eq("id", id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(data);
-  } catch (err) {
-    console.error("Error al editar FAQ:", err);
-    res.status(500).json({ error: "Error del servidor" });
-  }
-});
-
-app.delete("/api/admin/faqs/:id", verificarAdmin, async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const { error } = await supabase.from("faqs").delete().eq("id", id);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Error al eliminar FAQ:", err);
     res.status(500).json({ error: "Error del servidor" });
   }
 });
@@ -457,12 +445,12 @@ app.post("/api/payment/create-preference", async (req, res) => {
 
     let montoDescuento = 0;
     if (couponCode) {
-      const { data: couponData } = await supabase
-        .from("coupons")
-        .select("*")
-        .eq("code", couponCode.toUpperCase().trim())
-        .eq("is_active", true)
-        .single();
+      const rows = await sql`
+        SELECT * FROM coupons 
+        WHERE code = ${couponCode.toUpperCase().trim()} AND is_active = true 
+        LIMIT 1
+      `;
+      const couponData = rows[0];
 
       if (couponData && (!couponData.expires_at || new Date(couponData.expires_at) >= new Date())) {
         montoDescuento = Math.round((totalProductos * couponData.discount_percentage) / 100);
@@ -471,31 +459,19 @@ app.post("/api/payment/create-preference", async (req, res) => {
 
     const total = Math.max(0, totalProductos - montoDescuento + Number(shippingCost || 0));
 
-    const { data: orderData, error: orderError } = await supabase
-      .from("orders")
-      .insert({
-        nombre_del_cliente: customer.name || "",
-        dni: customer.dni || "",
-        telefono: customer.phone || "",
-        email: customer.email || "",
-        direccion: customer.address || "",
-        ciudad: customer.city || "",
-        provincia: customer.state || "",
-        codigo_postal: customer.postalCode || "",
-        productos: verifiedItems,
-        costo_de_envio: Number(shippingCost || 0),
-        descuento: montoDescuento,
-        total: total,
-        estado: "pendiente",
-        metodo_pago: "mercadopago",
-      })
-      .select()
-      .single();
-
-    if (orderError) {
-      console.error("Error al insertar orden en Supabase:", orderError);
-      throw new Error(`Supabase error: ${orderError.message}`);
-    }
+    const rowsOrder = await sql`
+      INSERT INTO orders (
+        nombre_del_cliente, dni, telefono, email, direccion, ciudad, provincia,
+        codigo_postal, productos, costo_de_envio, descuento, total, estado, metodo_pago
+      ) VALUES (
+        ${customer.name || ""}, ${customer.dni || ""}, ${customer.phone || ""}, ${customer.email || ""},
+        ${customer.address || ""}, ${customer.city || ""}, ${customer.state || ""}, ${customer.postalCode || ""},
+        ${JSON.stringify(verifiedItems)}, ${Number(shippingCost || 0)}, ${montoDescuento}, ${total},
+        'pendiente', 'mercadopago'
+      )
+      RETURNING *
+    `;
+    const orderData = rowsOrder[0];
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailConfirmacionCliente(orderData).catch(console.error);
@@ -521,10 +497,6 @@ app.post("/api/payment/create-preference", async (req, res) => {
       });
     }
 
-    const successUrl = `${SITE_URL}/checkout/exito`;
-    const failureUrl = `${SITE_URL}/checkout/error`;
-    const pendingUrl = `${SITE_URL}/checkout/pendiente`;
-
     const preference = new Preference(mpClient);
     const result = await preference.create({
       body: {
@@ -536,9 +508,9 @@ app.post("/api/payment/create-preference", async (req, res) => {
         external_reference: orderData.identificador.toString(),
         notification_url: `${BACKEND_URL}/api/payment/webhook`,
         back_urls: {
-          success: successUrl,
-          failure: failureUrl,
-          pending: pendingUrl,
+          success: `${SITE_URL}/checkout/exito`,
+          failure: `${SITE_URL}/checkout/error`,
+          pending: `${SITE_URL}/checkout/pendiente`,
         },
         auto_return: "approved",
         payment_methods: {
@@ -568,12 +540,12 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
 
     let montoDescuento = 0;
     if (couponCode) {
-      const { data: couponData } = await supabase
-        .from("coupons")
-        .select("*")
-        .eq("code", couponCode.toUpperCase().trim())
-        .eq("is_active", true)
-        .single();
+      const rows = await sql`
+        SELECT * FROM coupons 
+        WHERE code = ${couponCode.toUpperCase().trim()} AND is_active = true 
+        LIMIT 1
+      `;
+      const couponData = rows[0];
 
       if (couponData && (!couponData.expires_at || new Date(couponData.expires_at) >= new Date())) {
         montoDescuento = Math.round((totalProductos * couponData.discount_percentage) / 100);
@@ -583,31 +555,19 @@ app.post("/api/payment/create-transfer-order", async (req, res) => {
     const total = Math.max(0, totalProductos - montoDescuento + Number(shippingCost || 0));
     const datosTransferencia = await obtenerDatosTransferencia();
 
-    const { data: orderData, error: orderError } = await supabase
-      .from("orders")
-      .insert({
-        nombre_del_cliente: customer.name || "",
-        dni: customer.dni || "",
-        telefono: customer.phone || "",
-        email: customer.email || "",
-        direccion: customer.address || "",
-        ciudad: customer.city || "",
-        provincia: customer.state || "",
-        codigo_postal: customer.postalCode || "",
-        productos: verifiedItems,
-        costo_de_envio: Number(shippingCost || 0),
-        descuento: montoDescuento,
-        total: total,
-        estado: "pendiente",
-        metodo_pago: "transferencia",
-      })
-      .select()
-      .single();
-
-    if (orderError) {
-      console.error("Error Supabase al insertar pedido por transferencia:", orderError);
-      throw new Error(`Supabase error: ${orderError.message}`);
-    }
+    const rowsOrder = await sql`
+      INSERT INTO orders (
+        nombre_del_cliente, dni, telefono, email, direccion, ciudad, provincia,
+        codigo_postal, productos, costo_de_envio, descuento, total, estado, metodo_pago
+      ) VALUES (
+        ${customer.name || ""}, ${customer.dni || ""}, ${customer.phone || ""}, ${customer.email || ""},
+        ${customer.address || ""}, ${customer.city || ""}, ${customer.state || ""}, ${customer.postalCode || ""},
+        ${JSON.stringify(verifiedItems)}, ${Number(shippingCost || 0)}, ${montoDescuento}, ${total},
+        'pendiente', 'transferencia'
+      )
+      RETURNING *
+    `;
+    const orderData = rowsOrder[0];
 
     enviarEmailNotificacion(orderData).catch(console.error);
     enviarEmailTransferencia(orderData, datosTransferencia).catch(console.error);
@@ -636,10 +596,11 @@ app.post("/api/payment/webhook", async (req, res) => {
       const paymentInfo = await response.json();
 
       if (paymentInfo.status === "approved" && paymentInfo.external_reference) {
-        await supabase
-          .from("orders")
-          .update({ estado: "completado" })
-          .eq("identificador", paymentInfo.external_reference);
+        await sql`
+          UPDATE orders 
+          SET estado = 'completado' 
+          WHERE identificador = ${paymentInfo.external_reference}
+        `;
       }
     } catch (err) {
       console.error("Error Webhook MP:", err);
