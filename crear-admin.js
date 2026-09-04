@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, "../.env") });
 
 // --------- EDITÁ ESTOS DOS VALORES ---------
-const ADMIN_EMAIL = "ivanezequieljure1997@gmail.com";
+const ADMIN_EMAIL = "ivanezequieljure1997@hotmail.com";
 const ADMIN_PASSWORD = "AdminMatesBIB";
 // --------------------------------------------
 
